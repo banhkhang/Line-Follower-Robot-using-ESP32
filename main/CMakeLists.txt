@@ -3,9 +3,6 @@ idf_component_register(
         "main.c"
         "../boot/ota.c"
         "../components/application/app.c"
-
-        "../components/service/loadcell_service.c"
-        "../components/driver/hx711.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
         # "../components/driver/motor.c"   # uncomment once motor.c is ready
