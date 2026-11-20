@@ -1,3 +1,5 @@
+
+
 /* app.c */
 
 #include "app.h"
@@ -5,6 +7,7 @@
 #include "wifi_ap.h"
 #include "telemetry.h"
 #include "loadcell_service.h"
+#include "line_sensor_service.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,34 +33,36 @@ void app_start(void)
     /* 2. Open OTA window (turns on LineRobot-OTA; boot logs broadcast here!) */
     ota_boot_window();
 
-
-     /* 3. Normal start-up */
-    if (loadcell_service_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Load cell init failed");
+    /* 3. Normal start-up: Khởi tạo và hiệu chỉnh dãy 7 cảm biến TCRT5000 */
+    if (line_sensor_service_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Line sensor init failed");
         return;
     }
 
-    /* Zero the scale. The load cell must be empty right now. */
-    ESP_LOGI(TAG, "Taring in 2 s - keep the load cell EMPTY");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    if (loadcell_service_tare() != ESP_OK) {
-        ESP_LOGE(TAG, "No answer from HX711 - check DOUT/SCK wiring and 3V3 power");
-        return;
+    /* Lặp lại quy trình hiệu chỉnh bằng tay cho đến khi cả 7 mắt đều đạt chuẩn */
+    while (line_sensor_service_calibrate_manual() != ESP_OK) {
+        ESP_LOGW(TAG, "Thu hieu chinh lai sau 2 giay...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
-    ESP_LOGI(TAG, "Tare done, offset = %ld", (long)loadcell_service_get_offset());
 
-    /* Main loop: read the load cell and print it. Later: sensors, motors, line following. */
+    /* Main loop: Đọc và in sai số phương ngang thô (chưa qua bộ lọc) */
     while (1) {
-        loadcell_reading_t r;
+        line_sensor_reading_t sensor_data;
 
-        if (loadcell_service_read(&r) == ESP_OK) {
-            ESP_LOGI(TAG, "raw=%ld  net=%ld  grams=%.2f",
-                     (long)r.raw, (long)r.net, r.grams);
+        if (line_sensor_service_read(&sensor_data) == ESP_OK) {
+            if (sensor_data.line_detected) {
+                ESP_LOGI(TAG, "e_y_raw = %+6.2f mm | norm=[%.0f, %.0f, %.0f, %.0f, %.0f, %.0f, %.0f]",
+                         sensor_data.lateral_error_mm,
+                         sensor_data.norm[0], sensor_data.norm[1], sensor_data.norm[2],
+                         sensor_data.norm[3], sensor_data.norm[4], sensor_data.norm[5],
+                         sensor_data.norm[6]);
+            } else {
+                ESP_LOGW(TAG, "LOST LINE! last e_y_raw = %+6.2f mm", sensor_data.lateral_error_mm);
+            }
         } else {
-            ESP_LOGW(TAG, "Load cell read failed");
+            ESP_LOGE(TAG, "Line sensor read failed");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10)); /* Chu kỳ lấy mẫu 10ms (100Hz) */
     }
 }
