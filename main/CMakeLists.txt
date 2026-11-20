@@ -16,6 +16,7 @@ idf_component_register(
         "../components/driver/include"
 
     REQUIRES
+        esp_driver_ledc
         esp_driver_gpio
         esp_wifi
         esp_netif

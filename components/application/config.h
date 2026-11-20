@@ -56,7 +56,7 @@
 /* ---------------- OTA (wireless update) ---------------- */
 #define PIN_BOOT_BUTTON   0        /* BOOT button, pressed = LOW (press it AFTER reset, not during) */
 #define OTA_WINDOW_MS     100000    /* how long to wait for an upload after reset */
-#define OTA_WIFI_SSID     "LineRobot-OTA"
+#define OTA_WIFI_SSID     "LineRobot-TEST2"
 #define OTA_WIFI_PASS     "12345678"   /* at least 8 characters */
 
 /* ---------------- Telemetry (wireless log) ---------------- */
