@@ -6,13 +6,14 @@
 #include "telemetry.h"
 #include "config.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 
 #define LINE_MAX_LEN   160      /* longer lines are cut */
-#define QUEUE_LINES    32       /* lines waiting to be sent */
+#define QUEUE_LINES    64       /* lines waiting to be sent */
 #define PACKET_MAX     1000     /* bytes per UDP packet */
 
 typedef struct {
@@ -66,14 +67,50 @@ static int log_hook(const char *fmt, va_list args)
     return n;
 }
 
+static bool pc_connected(void)
+{
+    wifi_sta_list_t list;
+    return esp_wifi_ap_get_sta_list(&list) == ESP_OK && list.num > 0;
+}
+/* Created only when Wi-Fi is on, because the TCP/IP stack does not exist before that. */
+static int open_socket(void)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        return -1;
+    }
+    int yes = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+    return sock;
+}
 /* ---------------- queue -> UDP ---------------- */
 
 static void sender_task(void *arg)
 {
     static char packet[PACKET_MAX + LINE_MAX_LEN];
     line_t line;
+    int ready_ms = 0;
 
     for (;;) {
+        if (!pc_connected()) {
+            ready_ms = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        if (ready_ms < 1500) {
+            ready_ms += 200;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        if (s_sock < 0) {
+            s_sock = open_socket();
+            if (s_sock < 0) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+        }
+
+        /* wait for a line, then take everything else already waiting */
         if (xQueueReceive(s_queue, &line, portMAX_DELAY) != pdTRUE) {
             continue;
         }
@@ -101,13 +138,6 @@ esp_err_t telemetry_init(void)
         return ESP_OK;
     }
 
-    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s_sock < 0) {
-        return ESP_FAIL;
-    }
-    int yes = 1;
-    setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
-
     memset(&s_dest, 0, sizeof(s_dest));
     s_dest.sin_family      = AF_INET;
     s_dest.sin_port        = htons(TELEMETRY_PORT);
@@ -115,16 +145,12 @@ esp_err_t telemetry_init(void)
 
     s_queue = xQueueCreate(QUEUE_LINES, sizeof(line_t));
     if (s_queue == NULL) {
-        close(s_sock);
-        s_sock = -1;
         return ESP_ERR_NO_MEM;
     }
 
     if (xTaskCreate(sender_task, "telemetry", 4096, NULL, 1, NULL) != pdPASS) {
         vQueueDelete(s_queue);
         s_queue = NULL;
-        close(s_sock);
-        s_sock = -1;
         return ESP_ERR_NO_MEM;
     }
 

@@ -25,12 +25,6 @@
 /* Calibration factor: to be determined experimentally */
 #define HX711_CALIBRATION_FACTOR    1.0f
 
-/*
- * Counts per gram. Leave at 1.0 until you calibrate (see README).
- * While it is 1.0 the "grams" printed on the serial monitor are just raw counts.
- */
-#define LOADCELL_SCALE   1.0f
-
 /* ------------------------------------------------------------------ */
 /* Line sensor array (7x TCRT5000), analog inputs                      */
 /* ------------------------------------------------------------------ */

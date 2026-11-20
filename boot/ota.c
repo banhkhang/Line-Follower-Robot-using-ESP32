@@ -102,45 +102,12 @@ static esp_err_t update_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// static bool wifi_ap_start(void)
-// {
-//     /* . Init flash storage for Wifi radio calib*/
-
-//     esp_err_t err = nvs_flash_init();
-//     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-//         nvs_flash_erase();
-//         err = nvs_flash_init();
-//     }
-//     if (err != ESP_OK) return false;
-
-//     /* Layer 3 - Network: Initializes the lwIP TCP/IP stack,
-//     start the event loop,
-//     assigns the ESP32 192.168.4.1, and launches the DHCP server to hand out 192.168.4.2 to PC.*/
-
-//     if (esp_netif_init() != ESP_OK) return false;
-//     if (esp_event_loop_create_default() != ESP_OK) return false;
-//     esp_netif_create_default_wifi_ap();
-
-//     /* Layers 1 & 2 — Physical & Data Link: Allocates the Wi-Fi driver, 
-//     configures the SSID/WPA2 password, and turns on the 2.4 GHz radio antenna in Access Point mode.*/
-//     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-//     if (esp_wifi_init(&init) != ESP_OK) return false;
-
-//     wifi_config_t ap = { 0 };
-//     strncpy((char *)ap.ap.ssid, OTA_WIFI_SSID, sizeof(ap.ap.ssid) - 1);
-//     strncpy((char *)ap.ap.password, OTA_WIFI_PASS, sizeof(ap.ap.password) - 1);
-//     ap.ap.ssid_len       = strlen(OTA_WIFI_SSID);
-//     ap.ap.channel        = 1;
-//     ap.ap.max_connection = 2;
-//     ap.ap.authmode       = WIFI_AUTH_WPA2_PSK;
-
-//     if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK) return false;
-//     if (esp_wifi_set_config(WIFI_IF_AP, &ap) != ESP_OK) return false;
-//     return esp_wifi_start() == ESP_OK;
-// }
-
 void ota_boot_window(void)
 {
+    // =========================================================
+    // 1. GPIO CONFIGURATION
+    // =========================================================
+
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BOOT_BUTTON,
         .mode         = GPIO_MODE_INPUT,
@@ -154,16 +121,25 @@ void ota_boot_window(void)
     };
     gpio_config(&led);
 
-    /* Start Wi-Fi Layers 1-3 via shared module */
+    // =========================================================
+    // 2. START WIFI ACCESS POINT
+    // =========================================================
+
     if (wifi_ap_on(OTA_WIFI_SSID, OTA_WIFI_PASS) != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi failed to start, skipping OTA window");
         return;
     }
 
-    /* Layers 4 & 5: HTTP server */
+
+    // =========================================================
+    // 3. START HTTP SERVER
+    // =========================================================
+
     httpd_handle_t server = NULL;
+
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
+
     if (httpd_start(&server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "Web server failed to start, skipping OTA window");
         wifi_ap_off();
@@ -175,23 +151,100 @@ void ota_boot_window(void)
     httpd_register_uri_handler(server, &page);
     httpd_register_uri_handler(server, &update);
 
-    ESP_LOGI(TAG, "OTA window open for %d s. Join '%s', open http://192.168.4.1 (BOOT = skip)",
-             OTA_WINDOW_MS / 1000, OTA_WIFI_SSID);
+    // =========================================================
+    // 4. OTA BOOT WINDOW COUNTDOWN
+    // =========================================================
 
-    int elapsed = 0;
-    while (elapsed < OTA_WINDOW_MS || s_busy) {
-        if (!s_busy && gpio_get_level(PIN_BOOT_BUTTON) == 0) {
-            ESP_LOGI(TAG, "BOOT pressed, skipping OTA window");
+    ESP_LOGI(TAG,
+    "\n"
+    "\n"
+    "========================================\n"
+    "           OTA BOOT WINDOW              \n"
+    "========================================\n"
+    " Press BOOT button to skip OTA          \n"
+    " Wi-Fi SSID : %s\n"
+    " OTA URL    : http://192.168.4.1\n"
+    " Window     : %d seconds\n"
+    "========================================",
+    OTA_WIFI_SSID,
+    OTA_WINDOW_MS / 1000
+);
+
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t window_ticks = pdMS_TO_TICKS(OTA_WINDOW_MS);
+
+    int last_remaining = -1;
+    bool skipped = false;
+
+    while (1) {
+
+        TickType_t elapsed_ticks = xTaskGetTickCount() - start_tick;
+
+        TickType_t remaining_ticks =
+            (elapsed_ticks < window_ticks)
+            ? (window_ticks - elapsed_ticks)
+            : 0;
+
+        uint32_t remaining_ms =
+            (uint32_t)remaining_ticks * portTICK_PERIOD_MS;
+
+        int remaining_sec = (remaining_ms + 999) / 1000;
+
+        // Print countdown only when the displayed second changes.
+        if (remaining_sec != last_remaining) {
+
+            ESP_LOGI(TAG,"OTA AVAILABLE | %02d s remaining | Press BOOT to skip | WiFi: %s | URL: http://192.168.4.1",
+            remaining_sec,
+            OTA_WIFI_SSID
+        );
+
+            last_remaining = remaining_sec;
+        }
+
+        // Check whether the BOOT button is pressed.
+        if (remaining_ticks > 0 &&
+            !s_busy &&
+            gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+
+            ESP_LOGI(TAG, "BOOT button pressed");
+            ESP_LOGI(TAG, "Skipping OTA update window");
+
+            skipped = true;
             break;
         }
-        gpio_set_level(PIN_USER_LED, (elapsed / 250) % 2);
+
+        // Stop when the timeout expires and no upload is running.
+        if (remaining_ticks == 0 && !s_busy) {
+            ESP_LOGI(TAG, "OTA window expired");
+            break;
+        }
+
+        // LED heartbeat: blink every 250 ms.
+        uint32_t elapsed_ms =
+            (uint32_t)elapsed_ticks * portTICK_PERIOD_MS;
+
+        gpio_set_level(PIN_USER_LED, (elapsed_ms / 250) % 2);
+
         vTaskDelay(pdMS_TO_TICKS(50));
-        elapsed += 50;
     }
 
+    // =========================================================
+    // 5. SHUTDOWN OTA SERVICES
+    // =========================================================
+
+    if (skipped) {
+        ESP_LOGI(TAG, "OTA skipped by user");
+    }
+
+    ESP_LOGI(TAG, "Stopping HTTP server");
     httpd_stop(server);
+
 #if !USE_TELEMETRY
-    wifi_ap_off();           /* Only shut down Wi-Fi if telemetry is disabled! */
+    ESP_LOGI(TAG, "Stopping Wi-Fi Access Point");
+    wifi_ap_off();
 #endif
+
     gpio_set_level(PIN_USER_LED, 0);
+
+    ESP_LOGI(TAG, "OTA boot window finished");
 }

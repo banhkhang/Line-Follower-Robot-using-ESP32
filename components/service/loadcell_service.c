@@ -6,22 +6,70 @@
 static int32_t s_offset  = 0;
 static bool    s_enabled = false;
 
+#define HX711_SAT_MAX    8388607     /* a reading at full scale is a glitch (or an overloaded cell) */
+#define HX711_SAT_MIN   (-8388608)
+#define MAX_SAMPLES      16
+
+/* Takes `samples` readings, throws away full-scale ones, returns the MEDIAN. */
 static esp_err_t read_average(int samples, int32_t *average)
 {
-    int64_t sum = 0;
+    int32_t buf[MAX_SAMPLES];
+    if (samples > MAX_SAMPLES) {
+        samples = MAX_SAMPLES;
+    }
 
-    for (int i = 0; i < samples; i++) {
-        int32_t sample;
-        esp_err_t err = hx711_read_raw(&sample, LOADCELL_TIMEOUT_MS);
+    int bad = 0;
+    for (int i = 0; i < samples; ) {
+        int32_t s;
+        esp_err_t err = hx711_read_raw(&s, LOADCELL_TIMEOUT_MS);
         if (err != ESP_OK) {
             return err;
         }
-        sum += sample;
+        if (s >= HX711_SAT_MAX || s <= HX711_SAT_MIN) {
+            if (++bad > samples) {
+                return ESP_ERR_INVALID_RESPONSE;     /* mostly garbage: report it */
+            }
+            continue;                                /* skip it and read another */
+        }
+        buf[i++] = s;
     }
 
-    *average = (int32_t)(sum / samples);
+    /* sort (insertion sort, tiny array) */
+    for (int i = 1; i < samples; i++) {
+        int32_t key = buf[i];
+        int j = i - 1;
+        while (j >= 0 && buf[j] > key) {
+            buf[j + 1] = buf[j];
+            j--;
+        }
+        buf[j + 1] = key;
+    }
+
+    /* trimmed mean: drop the lowest and highest, average the rest (needs samples >= 3) */
+    int64_t sum = 0;
+    for (int i = 1; i < samples - 1; i++) {
+        sum += buf[i];
+    }
+    *average = (int32_t)(sum / (samples - 2));
     return ESP_OK;
 }
+
+// static esp_err_t read_average(int samples, int32_t *average)
+// {
+//     int64_t sum = 0;
+
+//     for (int i = 0; i < samples; i++) {
+//         int32_t sample;
+//         esp_err_t err = hx711_read_raw(&sample, LOADCELL_TIMEOUT_MS);
+//         if (err != ESP_OK) {
+//             return err;
+//         }
+//         sum += sample;
+//     }
+
+//     *average = (int32_t)(sum / samples);
+//     return ESP_OK;
+// }
 
 esp_err_t loadcell_service_init(void)
 {

@@ -9,13 +9,18 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_system.h"
 
 static const char *TAG = "app";
 
 static void system_services_init(void)
 {
-    wifi_ap_init_base();
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("esp_netif_lwip", ESP_LOG_WARN);
+
     telemetry_init();
+    wifi_ap_init_base();
+
     ESP_LOGI(TAG, "System telemetry ready");
 
     /* Opens SoftAP + HTTP upload page; keeps SoftAP alive if USE_TELEMETRY == 1 */
