@@ -24,6 +24,7 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_server
+        esp_timer
         nvs_flash
         app_update
     PRIV_REQUIRES esp_rom
