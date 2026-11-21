@@ -1,0 +1,618 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <esp_wifi.h>
+#include <esp_timer.h>
+#include <math.h>
+
+// ============================================================================
+// 1. WI-FI SOFTAP & HIL UDP PROTOCOL CONFIGURATION
+// ============================================================================
+static const char* AP_SSID          = "ESP32S3_HIL_BOT";
+static const char* AP_PASS          = "12345678";
+static const IPAddress AP_IP        (192, 168, 4, 1);   // ESP32-S3 SoftAP IP
+static const IPAddress AP_GATEWAY   (192, 168, 4, 1);
+static const IPAddress AP_SUBNET    (255, 255, 255, 0);
+
+static const uint16_t ESP_UDP_PORT  = 8889; // Local bound port (matches Simulink Remote port)
+static const uint16_t PC_UDP_PORT   = 8888; // Simulink UDP Receive Local port
+
+static const size_t   RX_PACKET_LEN = 21;   // Simulink -> ESP32-S3 (21 bytes)
+static const size_t   TX_PACKET_LEN = 6;    // ESP32-S3 -> Simulink (6 bytes)
+static const uint32_t FAILSAFE_MS   = 150;  // Stop motors if Simulink pauses > 150 ms
+
+static const uint8_t  RGB_LED_PIN   = 48;   // Onboard WS2812 RGB LED on YD-ESP32-S3
+
+// ============================================================================
+// 2. MECHANICAL GEOMETRY & BENCH-IDENTIFIED MOTOR PARAMETERS
+// ============================================================================
+static const float TS_SEC           = 0.005f;   // 200 Hz deterministic control period (5 ms)
+static const float WHEEL_RADIUS_M   = 0.0325f;  // R = 32.5 mm (MechanicalDesign.docx Table 3.8)
+static const float TRACK_WIDTH_M    = 0.190f;   // B = 190 mm (MechanicalDesign.docx Table 3.8)
+static const float M_CHASSIS_KG     = 2.0f;     // Empty robot mass m_xe = 2.0 kg (Table 3.7)
+
+// Sensor bar lookahead distance d1:
+// Set to 0.140 m to match Simulink read_sensors (X_sens = 140 mm).
+// Change to 0.075 m when deploying to physical chassis (Ls = 75 mm in MechanicalDesign.docx).
+static const float SENSOR_LOOKAHEAD_M = 0.140f;
+
+// 7-channel IR sensor lateral positions in body frame (+Y = Left, -Y = Right) [m]
+static const float Y_SENS_M[7]      = {0.030f, 0.020f, 0.010f, 0.000f, -0.010f, -0.020f, -0.030f};
+static const float OPT_SIGMA_M      = 0.006f;   // Gaussian beam width sigma = 6.0 mm (read_sensors)
+static const float ADC_NOISE_FLOOR  = 0.085f;   // Normalized background cut (~87 / 1023 ADC counts)
+
+// Bench-identified JGB37-520 (333 RPM) 2-DOF PI gains (CodeSTM_TunePID.txt)
+static const float KP_BASE          = 460.0f;   // [%/ (m/s)]
+static const float KI_BASE          = 2600.0f;  // [%/ m]
+static const float KFF_GAIN         = 86.23f;   // 1 / K_dc [%/ (m/s)]
+static const float PWM_DEADZONE_0   = 2.10f;    // Unloaded static friction [% PWM]
+static const float INT_BAND_BASE    = 0.035f;   // Conditional integration active band [m/s]
+
+// Variable-mass coupling parameters
+static const float TAU_0_SEC        = 0.055f;   // Bench time constant with wheel in air [s]
+static const float GAMMA_INERTIA    = 0.0384f;  // Time constant slope per kg [s/kg]
+static const float K_PWM_ROLL       = 1.55f;    // Rolling + slope friction per kg [% PWM/kg]
+static const float ADAPT_EXP_BETA   = 0.65f;    // Gain-scheduling exponent
+
+static const float PWM_MAX_LIMIT    = 100.0f;
+static const float PWM_MIN_REVERSE  = -100.0f;
+
+// ============================================================================
+// 3. ALPHA-BETA FILTER, ADAPTIVE LUENBERGER OBSERVER & INTEGRAL SMC PARAMETERS
+// ============================================================================
+// Alpha-Beta pre-filter for lateral sensor measurement e2 (200 Hz)
+static const float WN_FILT          = 95.0f;    // Natural frequency [rad/s]
+static const float ZETA_FILT        = 0.92f;    // Damping ratio
+static const float ALPHA_AB         = 1.0f - expf(-2.0f * ZETA_FILT * WN_FILT * TS_SEC);
+static const float BETA_AB          = (WN_FILT * TS_SEC) * (WN_FILT * TS_SEC);
+
+// Adaptive Luenberger Observer poles mapped from 20 Hz to 200 Hz: p_200 = p_20^(0.005/0.05)
+static const float P1_SLOW          = 0.9292f;  // 0.48^0.1 (noise rejection on straights/steady arcs)
+static const float P2_SLOW          = 0.9470f;  // 0.58^0.1
+static const float P1_FAST          = 0.8272f;  // 0.15^0.1 (rapid e3 tracking at curve entry)
+static const float P2_FAST          = 0.8706f;  // 0.25^0.1
+static const float TAU_CURV_SEC     = 0.045f;   // Low-pass time constant for path curvature c_hat [s]
+static const float V_OBS_MIN_DENOM  = 0.25f;    // Minimum velocity denominator for Ld2 stability [m/s]
+
+// Damped Integral Sliding-Mode / Kinematic Steering Law
+static const float K1_KINEMATIC     = 4.20f;    // Linear lateral convergence gain [1/s]
+static const float K_SMC_GAIN       = 0.18f;    // Sliding-mode switching gain [m/s]
+static const float PHI_BL_M         = 0.012f;   // Boundary layer thickness to eliminate chattering [m]
+static const float KI_SMC_GAIN      = 1.40f;    // Integral sliding surface gain [1/s]
+static const float KD_RATE_SEC      = 0.018f;   // Sliding surface lateral velocity damping [s]
+static const float Z_INT_MAX_M      = 0.015f;   // Anti-windup clamp on integral surface [m]
+static const float OMEGA_MAX_RADS   = 2.80f;    // Maximum yaw rate command [rad/s]
+
+// Speed profile limits
+static const float V_CRUISE_MAX     = 0.50f;    // Straight-line target speed [m/s]
+static const float V_CRUISE_MIN     = 0.30f;    // Cornering target speed floor [m/s]
+static const float V_WHEEL_MAX      = 0.72f;    // Outer wheel upper bound [m/s]
+static const float V_WHEEL_MIN      = 0.08f;    // Inner wheel lower bound [m/s]
+
+// ============================================================================
+// 4. SHARED HIL DATA & RTOS SYNCHRONIZATION
+// ============================================================================
+struct SharedHILState {
+    uint16_t sensor_adc[7];
+    uint8_t  mass_kg;
+    float    vL_meas_ms;
+    float    vR_meas_ms;
+    uint32_t last_rx_ms;
+    bool     link_active;
+
+    float    pwmL_cmd;
+    float    pwmR_cmd;
+};
+
+static SharedHILState hilState = {
+    {0, 0, 0, 0, 0, 0, 0},
+    0, 0.0f, 0.0f, 0, false,
+    0.0f, 0.0f
+};
+
+static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t controlTaskHandle = NULL;
+static WiFiUDP udp;
+static IPAddress pcRemoteIP(192, 168, 4, 2);
+static bool pcIPDiscovered = false;
+
+// ============================================================================
+// 5. GAUSS-NEWTON SINGLE-LINE TEMPLATE MATCHER (Y-JUNCTION ARBITRATION)
+// ============================================================================
+inline float evalSingleLineTemplate(float y_pos, float e_center) {
+    float dist = y_pos - e_center;
+    float val = expf(-(dist * dist) / (2.0f * OPT_SIGMA_M * OPT_SIGMA_M)) - ADC_NOISE_FLOOR;
+    return (val > 0.0f) ? val : 0.0f;
+}
+
+bool computeLateralErrorGaussNewton(
+    const uint16_t adc[7],
+    uint8_t mass_kg,
+    float e_pred_m,
+    float& e_lat_out_m
+) {
+    float I_eff[7];
+    float total_I = 0.0f;
+    int num_clusters = 0;
+    bool in_cluster = false;
+
+    // 1. Normalize ADC [0..1023], strip background noise, and count active clusters
+    for (int i = 0; i < 7; i++) {
+        float norm = (float)adc[i] / 1023.0f - ADC_NOISE_FLOOR;
+        if (norm < 0.02f) norm = 0.0f;
+        I_eff[i] = norm;
+        total_I += norm;
+
+        if (norm > 0.12f) {
+            if (!in_cluster) {
+                num_clusters++;
+                in_cluster = true;
+            }
+        } else {
+            in_cluster = false;
+        }
+    }
+
+    if (total_I < 0.15f) {
+        return false; // Line completely lost
+    }
+
+    // Standard centroid across all 7 channels
+    float weighted_sum = 0.0f;
+    for (int i = 0; i < 7; i++) {
+        weighted_sum += Y_SENS_M[i] * I_eff[i];
+    }
+    float e_centroid = weighted_sum / total_I;
+
+    // 2. Single-line regime: return direct continuous centroid
+    // For a single Gaussian line (sigma = 6 mm, pitch = 10 mm), total_I is <= 1.55
+    if (num_clusters < 2 && total_I <= 1.65f) {
+        e_lat_out_m = e_centroid;
+        return true;
+    }
+
+    // 3. Y-Junction Bifurcation Regime: 3-iteration Weighted Gauss-Newton Profile Fit
+    // Cargo mass selects target branch: 1 kg -> Upper (+Y, left), 2 kg -> Lower (-Y, right)
+    float branch_sign = (mass_kg == 1) ? 1.0f : -1.0f;
+
+    // Bias initial guess slightly toward desired branch when splitting from center
+    float e_est = e_pred_m + branch_sign * 0.0025f;
+    const float eps_e = 0.0001f; // 0.1 mm finite-difference step
+
+    for (int iter = 0; iter < 3; iter++) {
+        float sum_w_dT2 = 1e-6f;
+        float sum_w_dT_res = 0.0f;
+
+        for (int k = 0; k < 7; k++) {
+            float T0 = evalSingleLineTemplate(Y_SENS_M[k], e_est);
+            float Tp = evalSingleLineTemplate(Y_SENS_M[k], e_est + eps_e);
+            float Tm = evalSingleLineTemplate(Y_SENS_M[k], e_est - eps_e);
+            float dT = (Tp - Tm) / (2.0f * eps_e);
+
+            float res = I_eff[k] - T0;
+            float w = 1.0f;
+
+            // Directional residual masking: reject light coming from the unwanted branch
+            float side_pos = branch_sign * (Y_SENS_M[k] - e_est);
+            if (side_pos < -0.006f && res > 0.03f) {
+                w = 0.0f;   // Sensor belongs to the rejected branch
+            } else if (side_pos < 0.002f && res > 0.04f) {
+                w = 0.15f;  // Down-weight overlapping junction apex
+            }
+
+            sum_w_dT2    += w * dT * dT;
+            sum_w_dT_res += w * dT * res;
+        }
+
+        float step_e = sum_w_dT_res / sum_w_dT2;
+        if (step_e > 0.008f)  step_e = 0.008f;
+        if (step_e < -0.008f) step_e = -0.008f;
+        e_est += step_e;
+    }
+
+    // Clamp estimate within physical sensor bar span [-30 mm, +30 mm]
+    if (e_est > 0.030f)  e_est = 0.030f;
+    if (e_est < -0.030f) e_est = -0.030f;
+
+    e_lat_out_m = e_est;
+    return true;
+}
+
+// ============================================================================
+// 6. ADAPTIVE LUENBERGER OBSERVER (ESTIMATES HEADING ERROR e3 FROM 1 BAR)
+// ============================================================================
+class AdaptiveLuenbergerObserver {
+public:
+    void reset(float e2_init = 0.0f) {
+        e2_hat_ = e2_init;
+        e3_hat_ = 0.0f;
+        c_hat_  = 0.0f;
+    }
+
+    void update(float e2_meas, float v_act, float w_act) {
+        if (fabsf(v_act) < 0.04f) {
+            e2_hat_ = e2_meas;
+            return;
+        }
+
+        float v_denom = fmaxf(fabsf(v_act), V_OBS_MIN_DENOM);
+
+        // 1. Online path curvature estimation c_hat = omega / v
+        float c_raw = w_act / v_denom;
+        float alpha_c = TS_SEC / (TAU_CURV_SEC + TS_SEC);
+        c_hat_ = (1.0f - alpha_c) * c_hat_ + alpha_c * c_raw;
+
+        // 2. Smooth pole adaptation based on innovation magnitude |e2_meas - e2_hat|
+        float err_obs = e2_meas - e2_hat_;
+        float blend = (fabsf(err_obs) - 0.0006f) / 0.0015f;
+        if (blend < 0.0f) blend = 0.0f;
+        if (blend > 1.0f) blend = 1.0f;
+
+        float p1 = (1.0f - blend) * P1_SLOW + blend * P1_FAST;
+        float p2 = (1.0f - blend) * P2_SLOW + blend * P2_FAST;
+
+        // 3. Luenberger observer gains placing error dynamics poles at (p1, p2)
+        float Ld1 = 2.0f - (p1 + p2);
+        float Ld2 = (p1 * p2 - 1.0f + Ld1) / (v_denom * TS_SEC);
+
+        // 4. Kinematic prediction step at lookahead distance d1
+        float w_net = w_act - c_hat_ * v_act;
+        float e2_pred = e2_hat_
+                      + v_act * TS_SEC * sinf(e3_hat_)
+                      - SENSOR_LOOKAHEAD_M * TS_SEC * w_act
+                      - 0.5f * v_act * (TS_SEC * TS_SEC) * w_net;
+        float e3_pred = e3_hat_ - TS_SEC * w_net;
+
+        // 5. Innovation correction step
+        e2_hat_ = e2_pred + Ld1 * err_obs;
+        e3_hat_ = e3_pred + Ld2 * err_obs;
+
+        // Bound heading estimate to physically plausible range [-60 deg, +60 deg]
+        if (e3_hat_ > 1.05f)  e3_hat_ = 1.05f;
+        if (e3_hat_ < -1.05f) e3_hat_ = -1.05f;
+    }
+
+    float getE2Hat() const { return e2_hat_; }
+    float getE3Hat() const { return e3_hat_; }
+
+private:
+    float e2_hat_ = 0.0f;
+    float e3_hat_ = 0.0f;
+    float c_hat_  = 0.0f;
+};
+
+// ============================================================================
+// 7. MASS-ADAPTIVE 2-DOF PI INNER MOTOR CONTROLLER
+// ============================================================================
+class MassAdaptivePI {
+public:
+    void reset() {
+        integral_     = 0.0f;
+        prev_err_     = 0.0f;
+        v_ref_shaped_ = 0.0f;
+    }
+
+    float update(float v_ref_target, float v_meas, float m_total) {
+        // 1. Time-constant scaling ratio alpha_M = tau_eff(M) / tau_0
+        float tau_eff = TAU_0_SEC + GAMMA_INERTIA * m_total;
+        float alpha_m = tau_eff / TAU_0_SEC;
+
+        // 2. Inertia-aware reference slew-rate limiter
+        float accel_max = 2.5f / sqrtf(alpha_m);
+        float max_dv = accel_max * TS_SEC;
+        float dv = v_ref_target - v_ref_shaped_;
+        if (dv > max_dv)       dv = max_dv;
+        else if (dv < -max_dv) dv = -max_dv;
+        v_ref_shaped_ += dv;
+
+        float v_ref = v_ref_shaped_;
+        float err = v_ref - v_meas;
+
+        // 3. Gain-scheduled PI gains preserving pole-zero cancellation
+        float scale_p  = powf(alpha_m, ADAPT_EXP_BETA);
+        float kp_eff   = KP_BASE * scale_p;
+        float ki_eff   = KI_BASE * (scale_p / alpha_m);
+        float int_band = INT_BAND_BASE * sqrtf(alpha_m);
+
+        // 4. Feedforward + mass-dependent rolling/slope friction compensation
+        float pwm_comp = PWM_DEADZONE_0 + K_PWM_ROLL * m_total;
+        float u_ff = 0.0f;
+        if (v_ref > 0.005f)       u_ff = KFF_GAIN * v_ref + pwm_comp;
+        else if (v_ref < -0.005f) u_ff = KFF_GAIN * v_ref - pwm_comp;
+
+        // 5. Proportional + Conditional Trapezoidal Integration
+        float u_p = kp_eff * err;
+        float pwm_min_dyn = (v_ref > 0.05f) ? 0.0f : PWM_MIN_REVERSE;
+
+        float i_candidate = integral_;
+        if (fabsf(err) < int_band) {
+            i_candidate += ki_eff * (0.5f * TS_SEC) * (err + prev_err_);
+        }
+
+        float u_unsat = u_ff + u_p + i_candidate;
+        if (u_unsat > PWM_MAX_LIMIT) {
+            if (err < 0.0f && fabsf(err) < int_band) integral_ = i_candidate;
+            u_unsat = PWM_MAX_LIMIT;
+        } else if (u_unsat < pwm_min_dyn) {
+            if (err > 0.0f && fabsf(err) < int_band) integral_ = i_candidate;
+            u_unsat = pwm_min_dyn;
+        } else {
+            integral_ = i_candidate;
+        }
+
+        prev_err_ = err;
+        return u_unsat;
+    }
+
+private:
+    float integral_     = 0.0f;
+    float prev_err_     = 0.0f;
+    float v_ref_shaped_ = 0.0f;
+};
+
+static AdaptiveLuenbergerObserver observer;
+static MassAdaptivePI motorCtrlL;
+static MassAdaptivePI motorCtrlR;
+
+// ============================================================================
+// 8. CORE 1 REAL-TIME CONTROL TASK (200 Hz HARDWARE TIMER DRIVEN)
+// ============================================================================
+void IRAM_ATTR onControlTimerISR(void* arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (controlTaskHandle != NULL) {
+        vTaskNotifyGiveFromISR(controlTaskHandle, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+void controlTask(void* pvParameters) {
+    float e2_filt     = 0.0f;
+    float de2_filt    = 0.0f;
+    float e2_prev_smc = 0.0f;
+    float z_int_smc   = 0.0f;
+    float active_time = 0.0f;
+    bool  was_active  = false;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // 1. Atomic snapshot of latest HIL feedback
+        uint16_t adc_local[7];
+        uint8_t  mass_local;
+        float    vL_meas, vR_meas;
+        uint32_t last_rx;
+
+        taskENTER_CRITICAL(&stateMux);
+        for (int i = 0; i < 7; i++) adc_local[i] = hilState.sensor_adc[i];
+        mass_local = hilState.mass_kg;
+        vL_meas    = hilState.vL_meas_ms;
+        vR_meas    = hilState.vR_meas_ms;
+        last_rx    = hilState.last_rx_ms;
+        taskEXIT_CRITICAL(&stateMux);
+
+        uint32_t now_ms = millis();
+        bool link_ok = (last_rx > 0) && ((now_ms - last_rx) <= FAILSAFE_MS);
+
+        if (!link_ok) {
+            if (was_active) {
+                motorCtrlL.reset();
+                motorCtrlR.reset();
+                observer.reset(0.0f);
+                e2_filt     = 0.0f;
+                de2_filt    = 0.0f;
+                e2_prev_smc = 0.0f;
+                z_int_smc   = 0.0f;
+                active_time = 0.0f;
+                was_active  = false;
+            }
+            taskENTER_CRITICAL(&stateMux);
+            hilState.pwmL_cmd    = 0.0f;
+            hilState.pwmR_cmd    = 0.0f;
+            hilState.link_active = false;
+            taskEXIT_CRITICAL(&stateMux);
+            continue;
+        }
+
+        active_time += TS_SEC;
+
+        // 2. Alpha-Beta Prediction + Gauss-Newton Y-Junction Measurement
+        float e2_pred = e2_filt + de2_filt * TS_SEC;
+        float e2_raw  = e2_pred;
+        bool line_ok  = computeLateralErrorGaussNewton(adc_local, mass_local, e2_pred, e2_raw);
+
+        if (!was_active && line_ok) {
+            e2_filt     = e2_raw;
+            e2_prev_smc = e2_raw;
+            observer.reset(e2_raw);
+            was_active  = true;
+        }
+
+        if (line_ok) {
+            float res = e2_raw - e2_pred;
+            e2_filt  = e2_pred + ALPHA_AB * res;
+            de2_filt = de2_filt + (BETA_AB / TS_SEC) * res;
+        } else {
+            e2_filt = e2_pred; // Coast smoothly using velocity prediction if momentary dropout
+            de2_filt *= 0.90f;
+        }
+
+        // 3. Actual Vehicle Odometry & Adaptive Luenberger Observer Update
+        float v_act = 0.5f * (vR_meas + vL_meas);
+        float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
+        observer.update(e2_filt, v_act, w_act);
+        float e3_hat = observer.getE3Hat();
+
+        // 4. Damped Integral Sliding-Mode / Kinematic Steering Law
+        // Smooth startup ramp over first 0.25 s
+        float v_ramp = V_CRUISE_MAX * fminf(1.0f, active_time / 0.25f);
+
+        // Curvature-adaptive cornering speed reduction
+        float err_norm = fminf(fabsf(e2_filt) / 0.024f, 1.0f);
+        float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
+        float v_base   = fminf(v_ramp, v_turn);
+
+        // Integral sliding surface with startup windup lock
+        if (active_time > 0.25f && line_ok) {
+            z_int_smc += KI_SMC_GAIN * e2_filt * TS_SEC;
+            if (z_int_smc > Z_INT_MAX_M)  z_int_smc = Z_INT_MAX_M;
+            if (z_int_smc < -Z_INT_MAX_M) z_int_smc = -Z_INT_MAX_M;
+        }
+
+        float de2_clean = (e2_filt - e2_prev_smc) / TS_SEC;
+        e2_prev_smc = e2_filt;
+
+        float sigma = e2_filt + KD_RATE_SEC * de2_clean + z_int_smc;
+        float sat_sigma = sigma / PHI_BL_M;
+        if (sat_sigma > 1.0f)  sat_sigma = 1.0f;
+        if (sat_sigma < -1.0f) sat_sigma = -1.0f;
+
+        float alpha_steer = fminf(1.0f, fmaxf(0.15f, v_base / V_CRUISE_MAX));
+        float w_raw = (v_base * sinf(e3_hat) + alpha_steer * (K1_KINEMATIC * e2_filt + K_SMC_GAIN * sat_sigma))
+                      / SENSOR_LOOKAHEAD_M;
+
+        if (w_raw > OMEGA_MAX_RADS)  w_raw = OMEGA_MAX_RADS;
+        if (w_raw < -OMEGA_MAX_RADS) w_raw = -OMEGA_MAX_RADS;
+
+        // 5. Differential Drive Inverse Kinematics -> Wheel Speed Targets
+        float half_B  = 0.5f * TRACK_WIDTH_M;
+        float v_ref_L = fminf(fmaxf(v_base - half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
+        float v_ref_R = fminf(fmaxf(v_base + half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
+
+        // 6. Inner Mass-Adaptive 2-DOF PI Motor Controllers
+        float m_total = M_CHASSIS_KG + (float)mass_local;
+        float pwm_L   = motorCtrlL.update(v_ref_L, vL_meas, m_total);
+        float pwm_R   = motorCtrlR.update(v_ref_R, vR_meas, m_total);
+
+        // 7. Publish PWM outputs to Core 0 UDP transmitter
+        taskENTER_CRITICAL(&stateMux);
+        hilState.pwmL_cmd    = pwm_L;
+        hilState.pwmR_cmd    = pwm_R;
+        hilState.link_active = true;
+        taskEXIT_CRITICAL(&stateMux);
+    }
+}
+
+// ============================================================================
+// 9. CORE 0 WI-FI UDP COMMUNICATION & STATUS LED TASK
+// ============================================================================
+void sendUDPPacket(float pwmL, float pwmR) {
+    if (!pcIPDiscovered) return;
+
+    int16_t pwmL_scaled = (int16_t)lroundf(fminf(fmaxf(pwmL, -100.0f), 100.0f) * 100.0f);
+    int16_t pwmR_scaled = (int16_t)lroundf(fminf(fmaxf(pwmR, -100.0f), 100.0f) * 100.0f);
+
+    uint8_t tx_buf[TX_PACKET_LEN];
+    tx_buf[0] = 0xBB;
+    tx_buf[1] = (uint8_t)(pwmL_scaled & 0xFF);
+    tx_buf[2] = (uint8_t)((pwmL_scaled >> 8) & 0xFF);
+    tx_buf[3] = (uint8_t)(pwmR_scaled & 0xFF);
+    tx_buf[4] = (uint8_t)((pwmR_scaled >> 8) & 0xFF);
+    tx_buf[5] = tx_buf[1] ^ tx_buf[2] ^ tx_buf[3] ^ tx_buf[4];
+
+    udp.beginPacket(pcRemoteIP, PC_UDP_PORT);
+    udp.write(tx_buf, TX_PACKET_LEN);
+    udp.endPacket();
+}
+
+void networkTask(void* pvParameters) {
+    uint8_t rx_buf[64];
+    uint32_t last_led_ms = 0;
+
+    for (;;) {
+        int packetSize = udp.parsePacket();
+        while (packetSize > 0) {
+            if (packetSize == RX_PACKET_LEN) {
+                int len = udp.read(rx_buf, RX_PACKET_LEN);
+                if (len == RX_PACKET_LEN && rx_buf[0] == 0xAA) {
+                    uint8_t cs = 0;
+                    for (int k = 1; k <= 19; k++) cs ^= rx_buf[k];
+
+                    if (cs == rx_buf[20]) {
+                        pcRemoteIP = udp.remoteIP();
+                        pcIPDiscovered = true;
+
+                        uint16_t adc_tmp[7];
+                        for (int i = 0; i < 7; i++) {
+                            adc_tmp[i] = (uint16_t)rx_buf[2 * i + 1] |
+                                         ((uint16_t)rx_buf[2 * i + 2] << 8);
+                        }
+                        uint8_t mass_tmp = rx_buf[15];
+                        int16_t vL_mms = (int16_t)((uint16_t)rx_buf[16] | ((uint16_t)rx_buf[17] << 8));
+                        int16_t vR_mms = (int16_t)((uint16_t)rx_buf[18] | ((uint16_t)rx_buf[19] << 8));
+
+                        float pwmL_tx, pwmR_tx;
+                        taskENTER_CRITICAL(&stateMux);
+                        for (int i = 0; i < 7; i++) hilState.sensor_adc[i] = adc_tmp[i];
+                        hilState.mass_kg    = mass_tmp;
+                        hilState.vL_meas_ms = (float)vL_mms * 0.001f;
+                        hilState.vR_meas_ms = (float)vR_mms * 0.001f;
+                        hilState.last_rx_ms = millis();
+                        pwmL_tx = hilState.pwmL_cmd;
+                        pwmR_tx = hilState.pwmR_cmd;
+                        taskEXIT_CRITICAL(&stateMux);
+
+                        sendUDPPacket(pwmL_tx, pwmR_tx);
+                    }
+                }
+            } else {
+                udp.flush();
+            }
+            packetSize = udp.parsePacket();
+        }
+
+        if (millis() - last_led_ms >= 100) {
+            last_led_ms = millis();
+            bool active;
+            uint8_t mass_now;
+            taskENTER_CRITICAL(&stateMux);
+            active   = hilState.link_active;
+            mass_now = hilState.mass_kg;
+            taskEXIT_CRITICAL(&stateMux);
+
+            if (!active) {
+                neopixelWrite(RGB_LED_PIN, 0, 0, 25);   // Blue: Idle / waiting for Simulink
+            } else if (mass_now == 1) {
+                neopixelWrite(RGB_LED_PIN, 25, 20, 0);  // Yellow: 1 kg -> Upper branch
+            } else if (mass_now == 2) {
+                neopixelWrite(RGB_LED_PIN, 25, 0, 25);  // Magenta: 2 kg -> Lower branch
+            } else {
+                neopixelWrite(RGB_LED_PIN, 0, 25, 0);   // Green: 0 kg -> Unloaded
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// ============================================================================
+// 10. SETUP & ENTRY POINT
+// ============================================================================
+void setup() {
+    Serial.begin(115200);
+    neopixelWrite(RGB_LED_PIN, 25, 0, 0);
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+    WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 1);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    udp.begin(ESP_UDP_PORT);
+
+    xTaskCreatePinnedToCore(controlTask, "Control200Hz", 4096, NULL, configMAX_PRIORITIES - 1, &controlTaskHandle, 1);
+    xTaskCreatePinnedToCore(networkTask, "UDPNetwork",   4096, NULL, configMAX_PRIORITIES - 2, NULL, 0);
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = &onControlTimerISR,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "hil_200hz"
+    };
+    esp_timer_handle_t control_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &control_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(control_timer, 5000)); // 5000 us = 200 Hz
+}
+
+void loop() {
+    vTaskDelay(portMAX_DELAY);
+}

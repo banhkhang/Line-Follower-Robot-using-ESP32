@@ -24,7 +24,8 @@
 #define PC_UDP_PORT            8888     /* PC port Simulink (UDP Receive)     */
 #define HIL_RX_PACKET_LEN      21       /* Simulink -> ESP32 (0xAA)           */
 #define HIL_TX_PACKET_LEN      6        /* ESP32 -> Simulink (0xBB)           */
-#define HIL_FAILSAFE_MS        150      /* Ngắt PWM nếu mất gói > 150 ms      */
+#define HIL_LOCKSTEP_SYNC      1        /* 1 = chạy 1 bước điều khiển ngay khi nhận gói UDP */
+#define HIL_FAILSAFE_MS        1000     /* Reset trạng thái khi Simulink dừng > 1.0 s */
 
 /* ------------------------------------------------------------------ */
 /* Mechanical & Sensor Geometry                                       */
@@ -36,3 +37,26 @@
 
 /* 0.140f cho Simulink read_sensors; đổi sang 0.075f khi chạy xe thật */
 #define SENSOR_LOOKAHEAD_M     0.140f
+
+/* ------------------------------------------------------------------ */
+/* Crossbar (vạch ngang trạm tải hàng / đích) & Mission Timing        */
+/* ------------------------------------------------------------------ */
+#define CROSSBAR_SENSOR_TH      0.35f   /* Ngưỡng cường độ chuẩn hóa mỗi mắt IR (sau trừ nền) */
+#define CROSSBAR_MIN_ACTIVE     5       /* Tối thiểu 5/7 mắt cùng thấy vạch ngang */
+#define CROSSBAR_DEBOUNCE_SEC   0.030f  /* Duy trì 30 ms (6 chu kỳ 200 Hz) để xác nhận vạch ngang */
+
+#define LOAD_STOP_DWELL_SEC     2.0f    /* Thời gian dừng tại trạm tải hàng [s] */
+#define CROSSBAR_CLEAR_SEC      0.60f   /* Thời gian chạy thẳng vượt qua vạch ngang trạm tải [s] */
+#define GOAL_ARM_DELAY_SEC      2.0f    /* Thời gian khóa nhận diện vạch đích sau khi rời trạm tải [s] */
+#define LINE_LOSS_STOP_SEC      2.0f    /* Dừng khẩn cấp trên ESP nếu mất line liên tục 2 s */
+
+/* ------------------------------------------------------------------ */
+/* HIL Run Mode Selection                                             */
+/* ------------------------------------------------------------------ */
+#define MODE_LINE_FOLLOW       0   /* Chế độ bám line đầy đủ */
+#define MODE_INNER_STEP_TEST   1   /* Bước 1: Chỉ test vòng trong (S-curve + bậc thang) */
+
+#define HIL_RUN_MODE           MODE_INNER_STEP_TEST
+
+/* Băng thông thiết kế vòng trong [rad/s] (chỉnh duy nhất số này khi tune PI) */
+#define INNER_LOOP_WGC         30.0f

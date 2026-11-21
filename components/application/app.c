@@ -29,8 +29,6 @@ static const float OPT_SIGMA_M      = 0.006f;
 static const float ADC_NOISE_FLOOR  = 0.085f;
 
 /* Bench-identified JGB37-520 (333 RPM) 2-DOF PI gains */
-static const float KP_BASE          = 460.0f;
-static const float KI_BASE          = 2600.0f;
 static const float KFF_GAIN         = 86.23f;
 static const float PWM_DEADZONE_0   = 2.10f;
 static const float INT_BAND_BASE    = 0.035f;
@@ -39,7 +37,6 @@ static const float INT_BAND_BASE    = 0.035f;
 static const float TAU_0_SEC        = 0.055f;
 static const float GAMMA_INERTIA    = 0.0384f;
 static const float K_PWM_ROLL       = 1.55f;
-static const float ADAPT_EXP_BETA   = 0.65f;
 
 static const float PWM_MAX_LIMIT    = 100.0f;
 static const float PWM_MIN_REVERSE  = -100.0f;
@@ -55,21 +52,6 @@ static const float P1_FAST          = 0.8272f;
 static const float P2_FAST          = 0.8706f;
 static const float TAU_CURV_SEC     = 0.045f;
 static const float V_OBS_MIN_DENOM  = 0.25f;
-
-/* Damped Integral SMC / Kinematic Steering Law */
-static const float K1_KINEMATIC     = 4.20f;
-static const float K_SMC_GAIN       = 0.18f;
-static const float PHI_BL_M         = 0.012f;
-static const float KI_SMC_GAIN      = 1.40f;
-static const float KD_RATE_SEC      = 0.018f;
-static const float Z_INT_MAX_M      = 0.015f;
-static const float OMEGA_MAX_RADS   = 2.80f;
-
-/* Speed profile limits */
-static const float V_CRUISE_MAX     = 0.50f;
-static const float V_CRUISE_MIN     = 0.30f;
-static const float V_WHEEL_MAX      = 0.72f;
-static const float V_WHEEL_MIN      = 0.08f;
 
 /* ============================================================================
  * 2. SHARED HIL STATE & SYNCHRONIZATION
@@ -187,6 +169,28 @@ static bool compute_lateral_error_gauss_newton(
     return true;
 }
 
+typedef enum {
+    MISSION_TO_LOAD = 0,     /* Chạy từ điểm xuất phát tới trạm tải hàng */
+    MISSION_WAIT_LOAD,       /* Dừng tại vạch ngang trạm tải hàng để nhận tải */
+    MISSION_LEAVE_LOAD,      /* Chạy thẳng vượt qua vạch ngang trạm tải */
+    MISSION_TO_GOAL,         /* Bám line + tách nhánh Y theo khối lượng tới đích */
+    MISSION_STOPPED_GOAL,    /* Đã dừng hẳn tại vạch ngang đích */
+    MISSION_STOPPED_LOST     /* Đã dừng hẳn do mất line liên tục >= 2 s */
+} mission_state_t;
+
+/* Phát hiện vạch ngang: >= CROSSBAR_MIN_ACTIVE mắt cảm biến cùng vượt ngưỡng */
+static bool is_crossbar_detected(const uint16_t adc[7])
+{
+    int active_cnt = 0;
+    for (int i = 0; i < 7; i++) {
+        float norm = (float)adc[i] / 1023.0f - ADC_NOISE_FLOOR;
+        if (norm >= CROSSBAR_SENSOR_TH) {
+            active_cnt++;
+        }
+    }
+    return (active_cnt >= CROSSBAR_MIN_ACTIVE);
+}
+
 /* ============================================================================
  * 4. ADAPTIVE LUENBERGER OBSERVER
  * ============================================================================ */
@@ -262,19 +266,25 @@ static float motor_pi_update(mass_adaptive_pi_t *pi, float v_ref_target, float v
     float tau_eff = TAU_0_SEC + GAMMA_INERTIA * m_total;
     float alpha_m = tau_eff / TAU_0_SEC;
 
-    float accel_max = 2.5f / sqrtf(alpha_m);
+    /* Khi chạy STEP TEST tắt slew-rate để đo chính xác đáp ứng bậc thang Ts, OS% */
+#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
+    float v_ref = v_ref_target;
+    pi->v_ref_shaped = v_ref_target;
+#else
+    float accel_max = 1.8f / sqrtf(alpha_m);
     float max_dv    = accel_max * TS_SEC;
     float dv        = v_ref_target - pi->v_ref_shaped;
     if (dv > max_dv)       dv = max_dv;
     else if (dv < -max_dv) dv = -max_dv;
     pi->v_ref_shaped += dv;
-
     float v_ref = pi->v_ref_shaped;
-    float err   = v_ref - v_meas;
+#endif
 
-    float scale_p  = powf(alpha_m, ADAPT_EXP_BETA);
-    float kp_eff   = KP_BASE * scale_p;
-    float ki_eff   = KI_BASE * (scale_p / alpha_m);
+    float err = v_ref - v_meas;
+
+    /* Khử cực đối tượng: zI = 1 / tau_eff => PM không đổi theo khối lượng */
+    float kp_eff   = INNER_LOOP_WGC * tau_eff * KFF_GAIN;
+    float ki_eff   = INNER_LOOP_WGC * KFF_GAIN;
     float int_band = INT_BAND_BASE * sqrtf(alpha_m);
 
     float pwm_comp = PWM_DEADZONE_0 + K_PWM_ROLL * m_total;
@@ -283,7 +293,7 @@ static float motor_pi_update(mass_adaptive_pi_t *pi, float v_ref_target, float v
     else if (v_ref < -0.005f) u_ff = KFF_GAIN * v_ref - pwm_comp;
 
     float u_p         = kp_eff * err;
-    float pwm_min_dyn = (v_ref > 0.05f) ? 0.0f : PWM_MIN_REVERSE;
+    float pwm_min_dyn = (v_ref >= 0.0f) ? 0.0f : PWM_MIN_REVERSE;
 
     float i_candidate = pi->integral;
     if (fabsf(err) < int_band) {
@@ -316,134 +326,153 @@ static void on_control_timer(void *arg)
     }
 }
 
-static void control_task(void *pvParameters)
+#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
+/* Quỹ đạo kiểm thử chuẩn 7.0 s:
+ *  0.0 - 0.8 s: S-curve bậc 3 (0 -> 0.50 m/s)
+ *  0.8 - 1.8 s: Giữ 0.50 m/s
+ *  1.8 - 2.8 s: Bước nhảy lên 0.70 m/s
+ *  2.8 - 3.8 s: Bước nhảy xuống 0.50 m/s
+ *  3.8 - 4.8 s: Bước nhảy xuống 0.30 m/s
+ *  4.8 - 5.8 s: Bước nhảy lên 0.50 m/s
+ *  5.8 - 7.0 s: Phanh về 0.00 m/s (kiểm tra dừng)
+ */
+static float eval_inner_step_profile(float t_sec)
 {
-    (void)pvParameters;
+    if (t_sec < 0.8f) {
+        float tau = t_sec / 0.8f;
+        return 0.50f * (3.0f * tau * tau - 2.0f * tau * tau * tau);
+    } else if (t_sec < 1.8f) {
+        return 0.50f;
+    } else if (t_sec < 2.8f) {
+        return 0.70f;
+    } else if (t_sec < 3.8f) {
+        return 0.50f;
+    } else if (t_sec < 4.8f) {
+        return 0.30f;
+    } else if (t_sec < 5.8f) {
+        return 0.50f;
+    } else {
+        return 0.00f;
+    }
+}
+#endif
 
-    const float alpha_ab = 1.0f - expf(-2.0f * ZETA_FILT * WN_FILT * TS_SEC);
-    const float beta_ab  = (WN_FILT * TS_SEC) * (WN_FILT * TS_SEC);
-
+typedef struct {
     adaptive_observer_t observer;
     mass_adaptive_pi_t  motor_ctrl_L;
     mass_adaptive_pi_t  motor_ctrl_R;
+    float alpha_ab;
+    float beta_ab;
+    float e2_filt;
+    float de2_filt;
+    float e2_prev_smc;
+    float z_int_smc;
+    float active_time;
+    bool  was_active;
+    mission_state_t mission_state;
+    float crossbar_timer;
+    float state_timer;
+    float line_loss_timer;
+} hil_ctrl_ctx_t;
 
-    observer_reset(&observer, 0.0f);
-    motor_pi_reset(&motor_ctrl_L);
-    motor_pi_reset(&motor_ctrl_R);
+static void hil_ctx_reset(hil_ctrl_ctx_t *ctx)
+{
+    ctx->alpha_ab = 1.0f - expf(-2.0f * ZETA_FILT * WN_FILT * TS_SEC);
+    ctx->beta_ab  = (WN_FILT * TS_SEC) * (WN_FILT * TS_SEC);
+    observer_reset(&ctx->observer, 0.0f);
+    motor_pi_reset(&ctx->motor_ctrl_L);
+    motor_pi_reset(&ctx->motor_ctrl_R);
+    ctx->e2_filt         = 0.0f;
+    ctx->de2_filt        = 0.0f;
+    ctx->e2_prev_smc     = 0.0f;
+    ctx->z_int_smc       = 0.0f;
+    ctx->active_time     = 0.0f;
+    ctx->was_active      = false;
+    ctx->mission_state   = MISSION_TO_LOAD;
+    ctx->crossbar_timer  = 0.0f;
+    ctx->state_timer     = 0.0f;
+    ctx->line_loss_timer = 0.0f;
+}
 
-    float e2_filt     = 0.0f;
-    float de2_filt    = 0.0f;
-    float e2_prev_smc = 0.0f;
-    float z_int_smc   = 0.0f;
-    float active_time = 0.0f;
-    bool  was_active  = false;
+/* Thực hiện đúng 1 bước điều khiển Ts = 0.005 s đồng bộ 1:1 với gói UDP từ Simulink */
+static void hil_control_step(
+    hil_ctrl_ctx_t *ctx,
+    const uint16_t adc_local[7],
+    uint8_t mass_local,
+    float vL_meas,
+    float vR_meas,
+    float *pwmL_out,
+    float *pwmR_out)
+{
+    ctx->active_time += TS_SEC;
 
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
+    (void)adc_local;
+    ctx->was_active = true;
+    float v_ref   = eval_inner_step_profile(ctx->active_time);
+    float m_total = M_CHASSIS_KG + (float)mass_local;
+    *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref, vL_meas, m_total);
+    *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref, vR_meas, m_total);
+#else
+    /* Chế độ bám line (Bước 2 & 3) dùng cùng ngữ cảnh ctx */
+    ctx->state_timer += TS_SEC;
+    bool crossbar_raw = is_crossbar_detected(adc_local);
+    ctx->crossbar_timer = crossbar_raw ? (ctx->crossbar_timer + TS_SEC) : 0.0f;
+    bool crossbar_confirmed = (ctx->crossbar_timer >= CROSSBAR_DEBOUNCE_SEC);
 
-        uint16_t adc_local[7];
-        uint8_t  mass_local;
-        float    vL_meas, vR_meas;
-        uint32_t last_rx;
+    float e2_pred = ctx->e2_filt + ctx->de2_filt * TS_SEC;
+    float e2_raw  = e2_pred;
+    bool  line_ok = compute_lateral_error_gauss_newton(adc_local, mass_local, e2_pred, &e2_raw);
 
-        taskENTER_CRITICAL(&s_state_mux);
-        memcpy(adc_local, s_hil_state.sensor_adc, sizeof(adc_local));
-        mass_local = s_hil_state.mass_kg;
-        vL_meas    = s_hil_state.vL_meas_ms;
-        vR_meas    = s_hil_state.vR_meas_ms;
-        last_rx    = s_hil_state.last_rx_ms;
-        taskEXIT_CRITICAL(&s_state_mux);
-
-        uint32_t now_ms = get_time_ms();
-        bool link_ok = (last_rx > 0) && ((now_ms - last_rx) <= HIL_FAILSAFE_MS);
-
-        if (!link_ok) {
-            if (was_active) {
-                motor_pi_reset(&motor_ctrl_L);
-                motor_pi_reset(&motor_ctrl_R);
-                observer_reset(&observer, 0.0f);
-                e2_filt     = 0.0f;
-                de2_filt    = 0.0f;
-                e2_prev_smc = 0.0f;
-                z_int_smc   = 0.0f;
-                active_time = 0.0f;
-                was_active  = false;
-            }
-            taskENTER_CRITICAL(&s_state_mux);
-            s_hil_state.pwmL_cmd    = 0.0f;
-            s_hil_state.pwmR_cmd    = 0.0f;
-            s_hil_state.link_active = false;
-            taskEXIT_CRITICAL(&s_state_mux);
-            continue;
-        }
-
-        active_time += TS_SEC;
-
-        float e2_pred = e2_filt + de2_filt * TS_SEC;
-        float e2_raw  = e2_pred;
-        bool  line_ok = compute_lateral_error_gauss_newton(adc_local, mass_local, e2_pred, &e2_raw);
-
-        if (!was_active && line_ok) {
-            e2_filt     = e2_raw;
-            e2_prev_smc = e2_raw;
-            observer_reset(&observer, e2_raw);
-            was_active  = true;
-        }
-
-        if (line_ok) {
-            float res = e2_raw - e2_pred;
-            e2_filt   = e2_pred + alpha_ab * res;
-            de2_filt  = de2_filt + (beta_ab / TS_SEC) * res;
-        } else {
-            e2_filt   = e2_pred;
-            de2_filt *= 0.90f;
-        }
-
-        float v_act = 0.5f * (vR_meas + vL_meas);
-        float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
-        observer_update(&observer, e2_filt, v_act, w_act);
-        float e3_hat = observer.e3_hat;
-
-        float v_ramp   = V_CRUISE_MAX * fminf(1.0f, active_time / 0.25f);
-        float err_norm = fminf(fabsf(e2_filt) / 0.024f, 1.0f);
-        float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
-        float v_base   = fminf(v_ramp, v_turn);
-
-        if (active_time > 0.25f && line_ok) {
-            z_int_smc += KI_SMC_GAIN * e2_filt * TS_SEC;
-            if (z_int_smc > Z_INT_MAX_M)  z_int_smc = Z_INT_MAX_M;
-            if (z_int_smc < -Z_INT_MAX_M) z_int_smc = -Z_INT_MAX_M;
-        }
-
-        float de2_clean = (e2_filt - e2_prev_smc) / TS_SEC;
-        e2_prev_smc     = e2_filt;
-
-        float sigma     = e2_filt + KD_RATE_SEC * de2_clean + z_int_smc;
-        float sat_sigma = sigma / PHI_BL_M;
-        if (sat_sigma > 1.0f)  sat_sigma = 1.0f;
-        if (sat_sigma < -1.0f) sat_sigma = -1.0f;
-
-        float alpha_steer = fminf(1.0f, fmaxf(0.15f, v_base / V_CRUISE_MAX));
-        float w_raw = (v_base * sinf(e3_hat) + alpha_steer * (K1_KINEMATIC * e2_filt + K_SMC_GAIN * sat_sigma))
-                    / SENSOR_LOOKAHEAD_M;
-
-        if (w_raw > OMEGA_MAX_RADS)  w_raw = OMEGA_MAX_RADS;
-        if (w_raw < -OMEGA_MAX_RADS) w_raw = -OMEGA_MAX_RADS;
-
-        float half_B  = 0.5f * TRACK_WIDTH_M;
-        float v_ref_L = fminf(fmaxf(v_base - half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
-        float v_ref_R = fminf(fmaxf(v_base + half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
-
-        float m_total = M_CHASSIS_KG + (float)mass_local;
-        float pwm_L   = motor_pi_update(&motor_ctrl_L, v_ref_L, vL_meas, m_total);
-        float pwm_R   = motor_pi_update(&motor_ctrl_R, v_ref_R, vR_meas, m_total);
-
-        taskENTER_CRITICAL(&s_state_mux);
-        s_hil_state.pwmL_cmd    = pwm_L;
-        s_hil_state.pwmR_cmd    = pwm_R;
-        s_hil_state.link_active = true;
-        taskEXIT_CRITICAL(&s_state_mux);
+    if (!ctx->was_active && line_ok) {
+        ctx->e2_filt     = e2_raw;
+        ctx->e2_prev_smc = e2_raw;
+        observer_reset(&ctx->observer, e2_raw);
+        ctx->was_active  = true;
     }
+
+    float v_act = 0.5f * (vR_meas + vL_meas);
+    float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
+    if (line_ok) {
+        float res     = e2_raw - e2_pred;
+        ctx->e2_filt  = e2_pred + ctx->alpha_ab * res;
+        ctx->de2_filt = ctx->de2_filt + (ctx->beta_ab / TS_SEC) * res;
+    } else {
+        ctx->e2_filt   = e2_pred;
+        ctx->de2_filt *= 0.90f;
+    }
+    observer_update(&ctx->observer, ctx->e2_filt, v_act, w_act);
+
+    float v_ramp   = V_CRUISE_MAX * fminf(1.0f, ctx->active_time / 0.25f);
+    float err_norm = fminf(fabsf(ctx->e2_filt) / 0.024f, 1.0f);
+    float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
+    float v_base   = fminf(v_ramp, v_turn);
+
+    if (ctx->active_time > 0.25f && line_ok) {
+        ctx->z_int_smc += KI_SMC_GAIN * ctx->e2_filt * TS_SEC;
+        if (ctx->z_int_smc > Z_INT_MAX_M)  ctx->z_int_smc = Z_INT_MAX_M;
+        if (ctx->z_int_smc < -Z_INT_MAX_M) ctx->z_int_smc = -Z_INT_MAX_M;
+    }
+    float de2_clean = (ctx->e2_filt - ctx->e2_prev_smc) / TS_SEC;
+    ctx->e2_prev_smc = ctx->e2_filt;
+
+    float sigma     = ctx->e2_filt + KD_RATE_SEC * de2_clean + ctx->z_int_smc;
+    float sat_sigma = fminf(fmaxf(sigma / PHI_BL_M, -1.0f), 1.0f);
+    float alpha_str = fminf(1.0f, fmaxf(0.15f, v_base / V_CRUISE_MAX));
+    float w_raw     = (v_base * sinf(ctx->observer.e3_hat)
+                      + alpha_str * (K1_KINEMATIC * ctx->e2_filt + K_SMC_GAIN * sat_sigma))
+                      / SENSOR_LOOKAHEAD_M;
+    w_raw = fminf(fmaxf(w_raw, -OMEGA_MAX_RADS), OMEGA_MAX_RADS);
+
+    float half_B  = 0.5f * TRACK_WIDTH_M;
+    float v_ref_L = fminf(fmaxf(v_base - half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
+    float v_ref_R = fminf(fmaxf(v_base + half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
+    float m_total = M_CHASSIS_KG + (float)mass_local;
+
+    *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref_L, vL_meas, m_total);
+    *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref_R, vR_meas, m_total);
+    (void)crossbar_confirmed;
+#endif
 }
 
 /* ============================================================================
@@ -472,7 +501,7 @@ static void network_task(void *pvParameters)
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "Failed to create UDP socket: errno %d", errno);
+        ESP_LOGE(TAG, "Socket create failed: errno %d", errno);
         vTaskDelete(NULL);
         return;
     }
@@ -483,18 +512,17 @@ static void network_task(void *pvParameters)
     local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        ESP_LOGE(TAG, "Socket bind failed (port %d): errno %d", ESP_UDP_PORT, errno);
+        ESP_LOGE(TAG, "Socket bind failed: errno %d", errno);
         close(sock);
         vTaskDelete(NULL);
         return;
     }
 
-    /* Timeout 50 ms để task không treo vô hạn khi Simulink dừng */
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    ESP_LOGI(TAG, "HIL UDP listening on port %d -> reply to PC port %d",
-             ESP_UDP_PORT, PC_UDP_PORT);
+    hil_ctrl_ctx_t ctx;
+    hil_ctx_reset(&ctx);
 
     uint8_t rx_buf[64];
     struct sockaddr_in src_addr;
@@ -502,19 +530,31 @@ static void network_task(void *pvParameters)
     pc_dest.sin_family = AF_INET;
     pc_dest.sin_port   = htons(PC_UDP_PORT);
 
-    bool prev_active   = false;
-    uint8_t prev_mass  = 0xFF;
+    uint32_t last_rx_ms = 0;
+    bool     active     = false;
+
+    ESP_LOGI(TAG, "LOCKSTEP HIL UDP ready on port %d -> PC port %d", ESP_UDP_PORT, PC_UDP_PORT);
 
     for (;;) {
         socklen_t socklen = sizeof(src_addr);
         int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0,
                            (struct sockaddr *)&src_addr, &socklen);
 
+        uint32_t now_ms = get_time_ms();
+
         if (len == HIL_RX_PACKET_LEN && rx_buf[0] == 0xAA) {
             uint8_t cs = 0;
             for (int k = 1; k <= 19; k++) cs ^= rx_buf[k];
 
             if (cs == rx_buf[20]) {
+                /* Tự động reset sạch khi bắt đầu lượt chạy Simulink mới */
+                if (!active || (now_ms - last_rx_ms) > HIL_FAILSAFE_MS) {
+                    hil_ctx_reset(&ctx);
+                    active = true;
+                    ESP_LOGI(TAG, "LOCKSTEP HIL SESSION START (payload = %u kg)", rx_buf[15]);
+                }
+                last_rx_ms = now_ms;
+
                 uint16_t adc_tmp[7];
                 for (int i = 0; i < 7; i++) {
                     adc_tmp[i] = (uint16_t)rx_buf[2 * i + 1]
@@ -524,39 +564,18 @@ static void network_task(void *pvParameters)
                 int16_t vL_mms   = (int16_t)((uint16_t)rx_buf[16] | ((uint16_t)rx_buf[17] << 8));
                 int16_t vR_mms   = (int16_t)((uint16_t)rx_buf[18] | ((uint16_t)rx_buf[19] << 8));
 
-                float pwmL_tx, pwmR_tx;
-                taskENTER_CRITICAL(&s_state_mux);
-                memcpy(s_hil_state.sensor_adc, adc_tmp, sizeof(adc_tmp));
-                s_hil_state.mass_kg    = mass_tmp;
-                s_hil_state.vL_meas_ms = (float)vL_mms * 0.001f;
-                s_hil_state.vR_meas_ms = (float)vR_mms * 0.001f;
-                s_hil_state.last_rx_ms = get_time_ms();
-                pwmL_tx = s_hil_state.pwmL_cmd;
-                pwmR_tx = s_hil_state.pwmR_cmd;
-                taskEXIT_CRITICAL(&s_state_mux);
+                float pwmL_tx = 0.0f, pwmR_tx = 0.0f;
+                hil_control_step(&ctx, adc_tmp, mass_tmp,
+                                 (float)vL_mms * 0.001f, (float)vR_mms * 0.001f,
+                                 &pwmL_tx, &pwmR_tx);
 
-                /* Gửi trả về đúng IP của PC (Simulink) tại cổng 8888 */
                 pc_dest.sin_addr = src_addr.sin_addr;
                 send_udp_packet(sock, &pc_dest, pwmL_tx, pwmR_tx);
             }
-        }
-
-        /* Chỉ in log khi trạng thái kết nối hoặc khối lượng thay đổi */
-        bool active;
-        uint8_t mass_now;
-        taskENTER_CRITICAL(&s_state_mux);
-        active   = s_hil_state.link_active;
-        mass_now = s_hil_state.mass_kg;
-        taskEXIT_CRITICAL(&s_state_mux);
-
-        if (active != prev_active || (active && mass_now != prev_mass)) {
-            if (active) {
-                ESP_LOGI(TAG, "HIL ACTIVE | payload = %u kg", mass_now);
-            } else {
-                ESP_LOGW(TAG, "HIL IDLE / waiting for Simulink...");
-            }
-            prev_active = active;
-            prev_mass   = mass_now;
+        } else if (active && (now_ms - last_rx_ms) > HIL_FAILSAFE_MS) {
+            active = false;
+            hil_ctx_reset(&ctx);
+            ESP_LOGW(TAG, "LOCKSTEP HIL SESSION ENDED -> Reset ready for next run");
         }
     }
 }
@@ -568,7 +587,6 @@ void app_start(void)
 {
     ESP_LOGI(TAG, "Reset reason: %d", (int)esp_reset_reason());
 
-    /* Xác nhận firmware hợp lệ nếu bật Rollback trong menuconfig */
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
@@ -576,31 +594,13 @@ void app_start(void)
         esp_ota_mark_app_valid_cancel_rollback();
     }
 
-    /* 1. Khởi tạo tầng mạng nền */
     ESP_ERROR_CHECK(wifi_ap_init_base());
-
-    /* 2. Mở cửa sổ OTA (SoftAP ESP32S3_HIL_BOT, giữ nguyên AP khi kết thúc) */
     ota_boot_window();
 
-    /* 3. Khởi chạy 2 task HIL trên 2 nhân riêng biệt */
+    /* Chạy network_task + hil_control_step đồng bộ 1:1 ở ưu tiên cao */
     xTaskCreatePinnedToCore(
-        control_task, "HIL_Ctrl200Hz", 6144, NULL,
-        configMAX_PRIORITIES - 2, &s_control_task_handle, 1);
+        network_task, "HIL_Lockstep", 8192, NULL,
+        configMAX_PRIORITIES - 2, NULL, 1);
 
-    xTaskCreatePinnedToCore(
-        network_task, "HIL_UDP", 6144, NULL,
-        configMAX_PRIORITIES - 3, NULL, 0);
-
-    /* 4. Bật bộ định thời cứng 5000 us (200 Hz) */
-    const esp_timer_create_args_t timer_args = {
-        .callback        = &on_control_timer,
-        .arg             = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name            = "hil_200hz",
-    };
-    esp_timer_handle_t control_timer = NULL;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &control_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(control_timer, 5000));
-
-    ESP_LOGI(TAG, "HIL 200 Hz system started on ESP32-S3");
+    ESP_LOGI(TAG, "Lockstep HIL started");
 }
