@@ -7,21 +7,20 @@
 #include "freertos/portmacro.h"
 #include <math.h>
 
-#define ENC_ZERO_TIMEOUT_US  50000LL   /* 50 ms không có xung -> 0 RPM */
+#define ENC_ZERO_TIMEOUT_US   25000LL   /* 25 ms không có xung -> 0 RPM */
+#define ENC_FIRST_EDGE_MAX_US 50000LL   /* > 50 ms từ cạnh trước -> đồng bộ mốc, bỏ qua gai */
+#define ENC_GLITCH_GUARD_US   80LL      /* Lọc nhiễu EMI (< 80 us, tốc độ max 350 RPM có T=519 us) */
 
 typedef struct {
-    int pin_a;
-    int pin_b;
-    int dir_sign;
-    float cpr;
+    int   pin_a;
+    int   pin_b;
+    int   dir_sign;
+    float ppr_out;      /* Số cạnh lên kênh A mỗi vòng bánh xe = ENC_CPR / 4 = 330 */
 
-    /* Biến chia sẻ với ISR */
     portMUX_TYPE mux;
     volatile int32_t count;
     volatile int64_t last_edge_us;
-    volatile uint8_t prev_ab;
 
-    /* Trạng thái tính M/T tại chu kỳ lấy mẫu */
     int32_t prev_count;
     int64_t prev_edge_us;
     float   last_rpm;
@@ -30,67 +29,62 @@ typedef struct {
 static enc_state_t s_enc[2] = {
     {
         .pin_a = PIN_ENC_A_A, .pin_b = PIN_ENC_A_B,
-        .dir_sign = ENC_DIR_A, .cpr = ENC_CPR_A,
+        .dir_sign = ENC_DIR_A, .ppr_out = ENC_CPR_A * 0.25f,
         .mux = portMUX_INITIALIZER_UNLOCKED
     },
     {
         .pin_a = PIN_ENC_B_A, .pin_b = PIN_ENC_B_B,
-        .dir_sign = ENC_DIR_B, .cpr = ENC_CPR_B,
+        .dir_sign = ENC_DIR_B, .ppr_out = ENC_CPR_B * 0.25f,
         .mux = portMUX_INITIALIZER_UNLOCKED
     }
 };
 
-/* Bảng giải mã Quadrature 4x Gray-code */
-static const int8_t DRAM_ATTR s_qdec_lut[16] = {
-     0, +1, -1,  0,
-    -1,  0,  0, +1,
-    +1,  0,  0, -1,
-     0, -1, +1,  0
-};
-
-static inline uint8_t IRAM_ATTR read_ab_fast(const enc_state_t *e)
-{
-    uint32_t in = REG_READ(GPIO_IN_REG);
-    uint8_t a = (uint8_t)((in >> e->pin_a) & 1U);
-    uint8_t b = (uint8_t)((in >> e->pin_b) & 1U);
-    return (uint8_t)((a << 1) | b);
-}
-
-static void IRAM_ATTR encoder_isr(void *arg)
+/* Ngắt cạnh lên kênh A: đọc nhanh chân B từ thanh ghi GPIO_IN_REG
+ * Cực tính (b != 0 ? +1 : -1) giữ nguyên dấu với ENC_DIR_A/B của bản 4x trước đó */
+static void IRAM_ATTR encoder_ch_a_isr(void *arg)
 {
     enc_state_t *e = (enc_state_t *)arg;
     int64_t now_us = esp_timer_get_time();
 
     portENTER_CRITICAL_ISR(&e->mux);
-    uint8_t curr_ab = read_ab_fast(e);
-    int8_t step = s_qdec_lut[(e->prev_ab << 2) | curr_ab];
-    e->prev_ab = curr_ab;
-    if (step != 0) {
-        e->count += (step * e->dir_sign);
-        e->last_edge_us = now_us;
+    if (e->last_edge_us > 0 && (now_us - e->last_edge_us) < ENC_GLITCH_GUARD_US) {
+        portEXIT_CRITICAL_ISR(&e->mux);
+        return;
     }
+
+    uint32_t in = REG_READ(GPIO_IN_REG);
+    int8_t step = ((in >> e->pin_b) & 1U) ? +1 : -1;
+    e->count += (step * e->dir_sign);
+    e->last_edge_us = now_us;
     portEXIT_CRITICAL_ISR(&e->mux);
 }
 
 void encoder_init_on_core1(void)
 {
-    gpio_config_t io_cfg = {
-        .pin_bit_mask = (1ULL << PIN_ENC_A_A) | (1ULL << PIN_ENC_A_B) |
-                        (1ULL << PIN_ENC_B_A) | (1ULL << PIN_ENC_B_B),
+    /* Kênh A: chỉ ngắt cạnh lên (POSEDGE) */
+    gpio_config_t cfg_a = {
+        .pin_bit_mask = (1ULL << PIN_ENC_A_A) | (1ULL << PIN_ENC_B_A),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_ANYEDGE
+        .intr_type    = GPIO_INTR_POSEDGE
     };
-    gpio_config(&io_cfg);
+    gpio_config(&cfg_a);
 
-    /* Cài dịch vụ ISR trong IRAM ngay trên Core 1 */
+    /* Kênh B: chỉ đọc mức logic để xác định chiều quay, không cần ngắt */
+    gpio_config_t cfg_b = {
+        .pin_bit_mask = (1ULL << PIN_ENC_A_B) | (1ULL << PIN_ENC_B_B),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&cfg_b);
+
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
 
     for (int i = 0; i < 2; i++) {
-        s_enc[i].prev_ab = read_ab_fast(&s_enc[i]);
-        gpio_isr_handler_add(s_enc[i].pin_a, encoder_isr, &s_enc[i]);
-        gpio_isr_handler_add(s_enc[i].pin_b, encoder_isr, &s_enc[i]);
+        gpio_isr_handler_add(s_enc[i].pin_a, encoder_ch_a_isr, &s_enc[i]);
     }
     encoder_reset();
 }
@@ -102,7 +96,6 @@ void encoder_reset(void)
         portENTER_CRITICAL(&e->mux);
         e->count        = 0;
         e->last_edge_us = 0;
-        e->prev_ab      = read_ab_fast(e);
         portEXIT_CRITICAL(&e->mux);
 
         e->prev_count   = 0;
@@ -130,25 +123,24 @@ float encoder_sample_rpm(enc_ch_t ch, int64_t now_us, int16_t *out_delta)
     float rpm = 0.0f;
 
     if (delta != 0) {
-        int64_t dt_us;
-        if (e->prev_edge_us > 0 && edge_us > e->prev_edge_us) {
-            dt_us = edge_us - e->prev_edge_us;
+        if (e->prev_edge_us == 0 || (edge_us - e->prev_edge_us) > ENC_FIRST_EDGE_MAX_US) {
+            /* Cạnh đầu tiên sau khi đứng yên: đồng bộ mốc thời gian, không xuất gai vận tốc */
+            rpm = 0.0f;
         } else {
-            /* Xung đầu tiên sau khi đứng yên -> dùng chu kỳ lấy mẫu danh định */
-            dt_us = SYSID_TS_US;
+            int64_t dt_us = edge_us - e->prev_edge_us;
+            if (dt_us > 0) {
+                rpm = ((float)delta / e->ppr_out) * (60000000.0f / (float)dt_us);
+            }
         }
-        rpm = ((float)delta / e->cpr) * (60000000.0f / (float)dt_us);
-
         e->prev_count   = cnt;
         e->prev_edge_us = edge_us;
         e->last_rpm     = rpm;
     } else {
-        /* Không có xung mới trong 5 ms: chặn trên tốc độ theo thời gian trễ */
         if (e->prev_edge_us == 0 || (now_us - e->prev_edge_us) >= ENC_ZERO_TIMEOUT_US) {
             rpm = 0.0f;
             e->prev_edge_us = 0;
         } else {
-            float max_rpm = (1.0f / e->cpr) * (60000000.0f / (float)(now_us - e->prev_edge_us));
+            float max_rpm = (1.0f / e->ppr_out) * (60000000.0f / (float)(now_us - e->prev_edge_us));
             if (fabsf(e->last_rpm) > max_rpm) {
                 rpm = copysignf(max_rpm, e->last_rpm);
             } else {

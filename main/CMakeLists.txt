@@ -6,12 +6,14 @@ idf_component_register(
         "../components/driver/wifi_ap.c"
         "../components/driver/motor.c"
         "../components/driver/encoder.c"
+        "../components/service/vel_ctrl.c"
 
     INCLUDE_DIRS
         "."
         "../boot"
         "../components/application"
         "../components/driver/include"
+        "../components/service/include"
 
     REQUIRES
         esp_driver_gpio

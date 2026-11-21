@@ -1,4 +1,4 @@
-/* app.c - Motor Transfer Function Identification over Wi-Fi (Core 1 RT + Core 0 HTTP) */
+/* app.c - 2-DOF PI Velocity Controller & 10s Verification over Wi-Fi */
 
 #include "app.h"
 #include "ota.h"
@@ -6,6 +6,7 @@
 #include "config.h"
 #include "motor.h"
 #include "encoder.h"
+#include "vel_ctrl.h"
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
@@ -22,80 +23,61 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "sysid";
+static const char *TAG = "ctrl";
 
-/* ---------------- Cấu trúc bản ghi nhị phân 12 bytes/mẫu ---------------- */
+/* ---------------- Bản ghi nhị phân 14 bytes/mẫu (cả Motor A & B) ---------------- */
 typedef struct __attribute__((packed)) {
-    uint16_t seq;        /* 0..5999 -> t = seq * 0.005 s */
-    int16_t  pwm_x100;   /* PWM thực xuất [0.01 %], -10000..+10000 */
-    int16_t  rpm_a_x10;  /* Tốc độ Motor A [0.1 RPM], ±3276.7 RPM */
-    int16_t  rpm_b_x10;  /* Tốc độ Motor B [0.1 RPM], ±3276.7 RPM */
-    uint16_t dt_us_err;  /* |dt_actual - 5000| [us] để kiểm tra jitter */
-    int16_t  enc_delta;  /* Số xung 4x trong 5 ms của kênh đang đo */
-} sysid_sample_t;
+    uint16_t seq;         /* 0..1999 (cl10) hoặc 0..5999 (id30) -> t = seq * 0.005 s */
+    int16_t  vref_mms;    /* Vận tốc đặt [mm/s] (hoặc PWM*100 trong chế độ vòng hở) */
+    int16_t  va_mms;      /* Vận tốc đo Motor A [mm/s] */
+    int16_t  vb_mms;      /* Vận tốc đo Motor B [mm/s] */
+    int16_t  pwm_a_x100;  /* PWM thực xuất Motor A [0.01 %] */
+    int16_t  pwm_b_x100;  /* PWM thực xuất Motor B [0.01 %] */
+    uint16_t dt_us_err;   /* |dt_actual - 5000| [us] */
+} log_sample_t;
 
 typedef enum {
-    SYSID_IDLE = 0,
-    SYSID_RUNNING,
-    SYSID_DONE
-} sysid_state_t;
+    RUN_IDLE = 0,
+    RUN_ACTIVE,
+    RUN_DONE
+} run_state_t;
 
 typedef enum {
-    MODE_ID30 = 0,       /* 30 s (6000 mẫu): chuỗi bậc thang nhiều mức */
-    MODE_CHECK5          /* 5 s (1000 mẫu): kiểm tra deadzone, chiều encoder, jitter */
-} sysid_mode_t;
+    MODE_CL10 = 0,        /* 10 s (2000 mẫu): Nghiệm thu vòng kín 2-DOF PI */
+    MODE_ID30,            /* 30 s (6000 mẫu): Vòng hở nhận dạng */
+    MODE_CHECK5           /*  5 s (1000 mẫu): Kiểm tra chiều & deadzone */
+} run_mode_t;
 
 typedef enum {
-    TARGET_MOTOR_A = 0,
-    TARGET_MOTOR_B,
-    TARGET_MOTOR_AB
+    TARGET_A = 0,
+    TARGET_B,
+    TARGET_AB
 } motor_target_t;
 
-/* Bộ đệm RAM tĩnh: 6000 * 12 = 72,000 bytes (70.3 KB) */
-static sysid_sample_t s_log_buf[SYSID_MAX_SAMPLES];
+static log_sample_t *s_log_buf = NULL;
 
-static volatile sysid_state_t  s_state          = SYSID_IDLE;
+static volatile run_state_t    s_state          = RUN_IDLE;
 static volatile bool           s_start_req      = false;
 static volatile bool           s_abort_req      = false;
-static volatile sysid_mode_t   s_req_mode       = MODE_ID30;
-static volatile motor_target_t s_req_target     = TARGET_MOTOR_A;
+static volatile run_mode_t     s_req_mode       = MODE_CL10;
+static volatile motor_target_t s_req_target     = TARGET_AB;
 static volatile uint32_t       s_total_samples  = 0;
 static volatile uint32_t       s_logged_samples = 0;
 
 static TaskHandle_t s_rt_task_handle = NULL;
 
-/* ---------------- Quỹ đạo kích thích PWM ---------------- */
-/* Trả về PWM [%] tại chỉ số mẫu seq (Ts = 5 ms) */
-static float get_excitation_pwm(sysid_mode_t mode, uint32_t seq)
-{
-    uint32_t t_ms = seq * 5U;
+/* Tham số mặc định 2-DOF PI cho gá đỡ (w_gc = 35 rad/s) */
+static vel_ctrl_params_t s_params_a = {
+    .kp = 226.94f, .ki = 2978.15f, .kff = 85.09f,
+    .u_dz = 2.40f, .e_band = 0.035f, .u_max = 100.0f
+};
+static vel_ctrl_params_t s_params_b = {
+    .kp = 271.89f, .ki = 2855.99f, .kff = 81.60f,
+    .u_dz = 1.68f, .e_band = 0.035f, .u_max = 100.0f
+};
 
-    if (mode == MODE_CHECK5) {
-        /* 5 s: Kiểm tra ngưỡng ma sát tĩnh u_dz và chiều encoder */
-        if (t_ms <  500) return  0.0f;
-        if (t_ms < 1200) return 12.0f;
-        if (t_ms < 2000) return 20.0f;
-        if (t_ms < 3000) return 35.0f;
-        if (t_ms < 4200) return 55.0f;
-        return 0.0f;
-    }
-
-    /* MODE_ID30 (30 s): 0..20s Estimation (2/3), 20..30s Validation (1/3) */
-    if (t_ms <  1000) return  0.0f;   /* Nền 0% */
-    if (t_ms <  3500) return 30.0f;
-    if (t_ms <  6000) return 60.0f;
-    if (t_ms <  8500) return 40.0f;
-    if (t_ms < 11000) return 80.0f;
-    if (t_ms < 13500) return 25.0f;
-    if (t_ms < 16000) return 70.0f;
-    if (t_ms < 18000) return  0.0f;   /* Phanh về 0% kiểm tra suy giảm */
-    if (t_ms < 20500) return 50.0f;
-    if (t_ms < 23000) return 85.0f;   /* --- Tập Validation bắt đầu ~20 s --- */
-    if (t_ms < 25000) return 35.0f;
-    if (t_ms < 27500) return 65.0f;
-    if (t_ms < 29000) return 20.0f;
-    return 0.0f;                      /* Phanh dừng 1 s cuối */
-}
+static vel_ctrl_t s_ctrl_a;
+static vel_ctrl_t s_ctrl_b;
 
 static inline int16_t clamp_i16(float v)
 {
@@ -104,7 +86,54 @@ static inline int16_t clamp_i16(float v)
     return (int16_t)lroundf(v);
 }
 
-/* ---------------- Hardware Timer 200 Hz ISR trên Core 1 ---------------- */
+/* ---------------- Quỹ đạo đặt 10s vòng kín [m/s] ---------------- */
+static float get_cl10_vref_mps(uint32_t seq)
+{
+    float t = (float)seq * SYSID_TS_S;
+
+    if (t < 0.30f) return 0.0f;
+    if (t < 1.10f) {
+        /* S-curve bậc 3: 0 -> 0.5 m/s trong 0.80 s (a_max = 0.9375 m/s^2) */
+        float tau = (t - 0.30f) / 0.80f;
+        return 0.5f * (3.0f * tau * tau - 2.0f * tau * tau * tau);
+    }
+    if (t < 2.00f) return 0.5f;   /* Ổn định tại v_nom */
+    if (t < 3.30f) return 0.7f;   /* Bước 1: 0.5 -> 0.7 */
+    if (t < 4.60f) return 0.5f;   /* Bước 2: 0.7 -> 0.5 */
+    if (t < 5.90f) return 0.3f;   /* Bước 3: 0.5 -> 0.3 */
+    if (t < 7.20f) return 0.5f;   /* Bước 4: 0.3 -> 0.5 */
+    if (t < 8.50f) return 0.7f;   /* Bước 5: 0.5 -> 0.7 (lần 2) */
+    return 0.0f;                  /* Phanh Short Brake dừng hẳn */
+}
+
+/* ---------------- Quỹ đạo vòng hở (dự phòng) [%PWM] ---------------- */
+static float get_openloop_pwm(run_mode_t mode, uint32_t seq)
+{
+    uint32_t t_ms = seq * 5U;
+    if (mode == MODE_CHECK5) {
+        if (t_ms <  500) return  0.0f;
+        if (t_ms < 1500) return 20.0f;
+        if (t_ms < 3000) return 40.0f;
+        if (t_ms < 4200) return 60.0f;
+        return 0.0f;
+    }
+    if (t_ms <  1000) return  0.0f;
+    if (t_ms <  3500) return 30.0f;
+    if (t_ms <  6000) return 60.0f;
+    if (t_ms <  8500) return 40.0f;
+    if (t_ms < 11000) return 80.0f;
+    if (t_ms < 13500) return 25.0f;
+    if (t_ms < 16000) return 70.0f;
+    if (t_ms < 18000) return  0.0f;
+    if (t_ms < 20500) return 50.0f;
+    if (t_ms < 23000) return 85.0f;
+    if (t_ms < 25000) return 35.0f;
+    if (t_ms < 27500) return 65.0f;
+    if (t_ms < 29000) return 20.0f;
+    return 0.0f;
+}
+
+/* ---------------- GPTimer 200 Hz ISR trên Core 1 ---------------- */
 static bool IRAM_ATTR on_rt_timer_alarm(gptimer_handle_t timer,
                                         const gptimer_alarm_event_data_t *edata,
                                         void *user_ctx)
@@ -114,13 +143,11 @@ static bool IRAM_ATTR on_rt_timer_alarm(gptimer_handle_t timer,
     return (hp_woken == pdTRUE);
 }
 
-/* ---------------- Core 1: Hard Real-Time Sampling Task ---------------- */
-static void sysid_rt_task(void *pvParameters)
+/* ---------------- Core 1: Hard Real-Time Control Task ---------------- */
+static void rt_control_task(void *pvParameters)
 {
-    /* Cài ngắt encoder ngay trên Core 1 */
     encoder_init_on_core1();
 
-    /* Khởi tạo GPTimer 1 MHz, alarm mỗi 5000 us (200 Hz) trên Core 1 */
     gptimer_handle_t gptimer = NULL;
     gptimer_config_t t_cfg = {
         .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
@@ -136,14 +163,11 @@ static void sysid_rt_task(void *pvParameters)
     };
     ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &a_cfg));
 
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = on_rt_timer_alarm
-    };
+    gptimer_event_callbacks_t cbs = { .on_alarm = on_rt_timer_alarm };
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, xTaskGetCurrentTaskHandle()));
     ESP_ERROR_CHECK(gptimer_enable(gptimer));
 
     while (1) {
-        /* Chờ lệnh Start từ HTTP server (Core 0) */
         if (!s_start_req) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -152,19 +176,23 @@ static void sysid_rt_task(void *pvParameters)
         s_start_req = false;
         s_abort_req = false;
 
-        sysid_mode_t   mode   = s_req_mode;
+        run_mode_t     mode   = s_req_mode;
         motor_target_t target = s_req_target;
-        uint32_t       n_samp = (mode == MODE_CHECK5) ? 1000U : SYSID_MAX_SAMPLES;
+        uint32_t       n_samp = (mode == MODE_CL10)   ? 2000U :
+                                (mode == MODE_CHECK5) ? 1000U : LOG_MAX_SAMPLES;
+
+        /* Nạp mới tham số 2-DOF PI trước mỗi lượt chạy */
+        vel_ctrl_init(&s_ctrl_a, &s_params_a);
+        vel_ctrl_init(&s_ctrl_b, &s_params_b);
 
         s_total_samples  = n_samp;
         s_logged_samples = 0;
-        s_state          = SYSID_RUNNING;
+        s_state          = RUN_ACTIVE;
 
         encoder_reset();
         motor_stop_all_brake();
         gpio_set_level(PIN_USER_LED, 1);
 
-        /* Xóa notify tồn đọng và bắt đầu nhịp 5 ms */
         ulTaskNotifyTake(pdTRUE, 0);
         ESP_ERROR_CHECK(gptimer_set_raw_count(gptimer, 0));
         ESP_ERROR_CHECK(gptimer_start(gptimer));
@@ -182,75 +210,101 @@ static void sysid_rt_task(void *pvParameters)
                 break;
             }
 
-            /* 1. Đọc vận tốc M/T 2 kênh */
-            int16_t da = 0, db = 0;
-            float rpm_a = encoder_sample_rpm(ENC_CH_A, now_us, &da);
-            float rpm_b = encoder_sample_rpm(ENC_CH_B, now_us, &db);
+            /* 1. Đo vận tốc dài [m/s] theo M/T */
+            float va_mps = encoder_sample_rpm(ENC_CH_A, now_us, NULL) * RPM_TO_MPS;
+            float vb_mps = encoder_sample_rpm(ENC_CH_B, now_us, NULL) * RPM_TO_MPS;
 
-            /* 2. Tính & xuất PWM bước kế tiếp */
-            float pwm_pct = get_excitation_pwm(mode, seq);
-            if (target == TARGET_MOTOR_A) {
-                motor_set_pwm(MOTOR_CH_A, pwm_pct);
-                motor_coast(MOTOR_CH_B);
-            } else if (target == TARGET_MOTOR_B) {
-                motor_coast(MOTOR_CH_A);
-                motor_set_pwm(MOTOR_CH_B, pwm_pct);
+            float ref_val = 0.0f;
+            float pwm_a   = 0.0f;
+            float pwm_b   = 0.0f;
+
+            /* 2. Tính toán điều khiển và xuất PWM float trực tiếp lên 12-bit LEDC */
+            if (mode == MODE_CL10) {
+                float vref_mps = get_cl10_vref_mps(seq);
+                ref_val = vref_mps * 1000.0f; /* Lưu mm/s */
+
+                if (target == TARGET_A || target == TARGET_AB) {
+                    pwm_a = vel_ctrl_step(&s_ctrl_a, vref_mps, va_mps, SYSID_TS_S);
+                    motor_set_pwm(MOTOR_CH_A, pwm_a);
+                } else {
+                    motor_coast(MOTOR_CH_A);
+                }
+
+                if (target == TARGET_B || target == TARGET_AB) {
+                    pwm_b = vel_ctrl_step(&s_ctrl_b, vref_mps, vb_mps, SYSID_TS_S);
+                    motor_set_pwm(MOTOR_CH_B, pwm_b);
+                } else {
+                    motor_coast(MOTOR_CH_B);
+                }
             } else {
-                motor_set_pwm(MOTOR_CH_A, pwm_pct);
-                motor_set_pwm(MOTOR_CH_B, pwm_pct);
+                float pwm_cmd = get_openloop_pwm(mode, seq);
+                ref_val = pwm_cmd * 100.0f;
+
+                if (target == TARGET_A || target == TARGET_AB) {
+                    pwm_a = pwm_cmd;
+                    motor_set_pwm(MOTOR_CH_A, pwm_a);
+                } else {
+                    motor_coast(MOTOR_CH_A);
+                }
+
+                if (target == TARGET_B || target == TARGET_AB) {
+                    pwm_b = pwm_cmd;
+                    motor_set_pwm(MOTOR_CH_B, pwm_b);
+                } else {
+                    motor_coast(MOTOR_CH_B);
+                }
             }
 
-            /* 3. Ghi bản ghi 12 bytes vào RAM (không log UART/Wi-Fi) */
+            /* 3. Ghi RAM (tuyệt đối không gọi Wi-Fi/ESP_LOG trong vòng 200 Hz) */
             int64_t err_us = (seq == 0) ? 0 : llabs(dt_us - SYSID_TS_US);
             if (err_us > 65535) err_us = 65535;
 
-            sysid_sample_t *rec = &s_log_buf[seq];
-            rec->seq       = (uint16_t)seq;
-            rec->pwm_x100  = clamp_i16(pwm_pct * 100.0f);
-            rec->rpm_a_x10 = clamp_i16(rpm_a * 10.0f);
-            rec->rpm_b_x10 = clamp_i16(rpm_b * 10.0f);
-            rec->dt_us_err = (uint16_t)err_us;
-            rec->enc_delta = (target == TARGET_MOTOR_B) ? db : da;
+            log_sample_t *rec = &s_log_buf[seq];
+            rec->seq        = (uint16_t)seq;
+            rec->vref_mms   = clamp_i16(ref_val);
+            rec->va_mms     = clamp_i16(va_mps * 1000.0f);
+            rec->vb_mms     = clamp_i16(vb_mps * 1000.0f);
+            rec->pwm_a_x100 = clamp_i16(pwm_a * 100.0f);
+            rec->pwm_b_x100 = clamp_i16(pwm_b * 100.0f);
+            rec->dt_us_err  = (uint16_t)err_us;
 
             s_logged_samples = seq + 1;
         }
 
         ESP_ERROR_CHECK(gptimer_stop(gptimer));
 
-        /* Phanh Short Brake 0.5 s rồi nhả về Coast để tránh nóng cầu H */
         motor_stop_all_brake();
         vTaskDelay(pdMS_TO_TICKS(500));
         motor_stop_all_coast();
         gpio_set_level(PIN_USER_LED, 0);
 
-        s_state = SYSID_DONE;
+        s_state = RUN_DONE;
     }
 }
 
 /* ---------------- Core 0: HTTP Endpoints cho MATLAB ---------------- */
 static esp_err_t http_start_handler(httpd_req_t *req)
 {
-    if (s_state == SYSID_RUNNING) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_sendstr(req, "Test already running");
+    if (s_state == RUN_ACTIVE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Test already running");
         return ESP_OK;
     }
 
-    sysid_mode_t   mode   = MODE_ID30;
-    motor_target_t target = TARGET_MOTOR_A;
+    run_mode_t     mode   = MODE_CL10;
+    motor_target_t target = TARGET_AB;
 
     char query[96] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char val[24];
         if (httpd_query_key_value(query, "mode", val, sizeof(val)) == ESP_OK) {
-            if (strcmp(val, "check5") == 0) mode = MODE_CHECK5;
+            if (strcmp(val, "id30") == 0)        mode = MODE_ID30;
+            else if (strcmp(val, "check5") == 0) mode = MODE_CHECK5;
+            else                                 mode = MODE_CL10;
         }
         if (httpd_query_key_value(query, "motor", val, sizeof(val)) == ESP_OK) {
-            if (strcmp(val, "B") == 0 || strcmp(val, "b") == 0) {
-                target = TARGET_MOTOR_B;
-            } else if (strcmp(val, "AB") == 0 || strcmp(val, "ab") == 0) {
-                target = TARGET_MOTOR_AB;
-            }
+            if (strcmp(val, "A") == 0 || strcmp(val, "a") == 0)      target = TARGET_A;
+            else if (strcmp(val, "B") == 0 || strcmp(val, "b") == 0) target = TARGET_B;
+            else                                                     target = TARGET_AB;
         }
     }
 
@@ -258,7 +312,42 @@ static esp_err_t http_start_handler(httpd_req_t *req)
     s_req_target = target;
     s_start_req  = true;
 
-    const char *resp = "{\"ok\":true,\"msg\":\"started\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"started\"}");
+    return ESP_OK;
+}
+
+static esp_err_t http_tune_handler(httpd_req_t *req)
+{
+    if (s_state == RUN_ACTIVE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cannot tune while running");
+        return ESP_OK;
+    }
+
+    char query[192] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query");
+        return ESP_OK;
+    }
+
+    char val[32];
+    vel_ctrl_params_t *p = &s_params_a;
+    if (httpd_query_key_value(query, "motor", val, sizeof(val)) == ESP_OK) {
+        if (strcmp(val, "B") == 0 || strcmp(val, "b") == 0) {
+            p = &s_params_b;
+        }
+    }
+
+    if (httpd_query_key_value(query, "kp", val, sizeof(val)) == ESP_OK)    p->kp     = strtof(val, NULL);
+    if (httpd_query_key_value(query, "ki", val, sizeof(val)) == ESP_OK)    p->ki     = strtof(val, NULL);
+    if (httpd_query_key_value(query, "kff", val, sizeof(val)) == ESP_OK)   p->kff    = strtof(val, NULL);
+    if (httpd_query_key_value(query, "udz", val, sizeof(val)) == ESP_OK)   p->u_dz   = strtof(val, NULL);
+    if (httpd_query_key_value(query, "eband", val, sizeof(val)) == ESP_OK) p->e_band = strtof(val, NULL);
+
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"kp\":%.2f,\"ki\":%.2f,\"kff\":%.2f,\"udz\":%.2f,\"eband\":%.4f}",
+             p->kp, p->ki, p->kff, p->u_dz, p->e_band);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
     return ESP_OK;
@@ -274,8 +363,8 @@ static esp_err_t http_stop_handler(httpd_req_t *req)
 
 static esp_err_t http_status_handler(httpd_req_t *req)
 {
-    const char *st_str = (s_state == SYSID_RUNNING) ? "running" :
-                         (s_state == SYSID_DONE)    ? "done"    : "idle";
+    const char *st_str = (s_state == RUN_ACTIVE) ? "running" :
+                         (s_state == RUN_DONE)   ? "done"    : "idle";
     char buf[128];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"logged\":%lu,\"total\":%lu}",
@@ -290,36 +379,33 @@ static esp_err_t http_status_handler(httpd_req_t *req)
 
 static esp_err_t http_dump_handler(httpd_req_t *req)
 {
-    if (s_state == SYSID_RUNNING) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_sendstr(req, "Still capturing");
+    if (s_state == RUN_ACTIVE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Still capturing");
         return ESP_OK;
     }
 
     uint32_t count = s_logged_samples;
-    if (count == 0) {
+    if (count == 0 || s_log_buf == NULL) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No data");
         return ESP_OK;
     }
 
     httpd_resp_set_type(req, "application/octet-stream");
     const uint8_t *ptr = (const uint8_t *)s_log_buf;
-    size_t remaining   = count * sizeof(sysid_sample_t);
+    size_t remaining   = count * sizeof(log_sample_t);
     const size_t chunk = 4096;
 
     while (remaining > 0) {
         size_t n = (remaining > chunk) ? chunk : remaining;
         esp_err_t err = httpd_resp_send_chunk(req, (const char *)ptr, n);
-        if (err != ESP_OK) {
-            return err;
-        }
+        if (err != ESP_OK) return err;
         ptr       += n;
         remaining -= n;
     }
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
-static void start_sysid_http_server(void)
+static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = SYSID_HTTP_PORT;
@@ -327,12 +413,13 @@ static void start_sysid_http_server(void)
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start SysID HTTP server on port %d", SYSID_HTTP_PORT);
+        ESP_LOGE(TAG, "Failed to start HTTP server");
         return;
     }
 
     static const httpd_uri_t uris[] = {
         { .uri = "/start",    .method = HTTP_GET, .handler = http_start_handler  },
+        { .uri = "/tune",     .method = HTTP_GET, .handler = http_tune_handler   },
         { .uri = "/stop",     .method = HTTP_GET, .handler = http_stop_handler   },
         { .uri = "/status",   .method = HTTP_GET, .handler = http_status_handler },
         { .uri = "/dump.bin", .method = HTTP_GET, .handler = http_dump_handler   },
@@ -340,26 +427,18 @@ static void start_sysid_http_server(void)
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
     }
-    ESP_LOGI(TAG, "SysID HTTP server ready: http://192.168.4.1:%d", SYSID_HTTP_PORT);
+    ESP_LOGI(TAG, "HTTP server ready on http://192.168.4.1:%d", SYSID_HTTP_PORT);
 }
 
-/* Đảm bảo SoftAP luôn bật sau khi ota_boot_window() kết thúc */
 static bool ensure_wifi_ap_online(void)
 {
     wifi_mode_t mode;
     esp_err_t err = esp_wifi_get_mode(&mode);
-
     if (err == ESP_ERR_WIFI_NOT_INIT) {
-        ESP_LOGW(TAG, "Wi-Fi da bi de-init sau OTA, dang khoi tao lai...");
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        err = esp_wifi_init(&cfg);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
-            return false;
-        }
+        if (esp_wifi_init(&cfg) != ESP_OK) return false;
     }
 
-    /* Dung sach truoc khi cau hinh lai AP moi */
     esp_wifi_stop();
 
     wifi_config_t ap_cfg = { 0 };
@@ -371,27 +450,10 @@ static bool ensure_wifi_ap_online(void)
     ap_cfg.ap.authmode         = WIFI_AUTH_WPA2_PSK;
     ap_cfg.ap.pmf_cfg.required = false;
 
-    err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    err = esp_wifi_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_start failed: %s (free heap: %lu)",
-                 esp_err_to_name(err), (unsigned long)esp_get_free_heap_size());
-        return false;
-    }
-
-    ESP_LOGI(TAG, "SysID AP ON: SSID=%s, free heap=%lu bytes",
-             SYSID_WIFI_SSID, (unsigned long)esp_get_free_heap_size());
+    if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK) return false;
+    if (esp_wifi_set_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) return false;
+    if (esp_wifi_start() != ESP_OK) return false;
+    esp_wifi_set_ps(WIFI_PS_NONE);
     return true;
 }
 
@@ -407,10 +469,7 @@ static void blink_ready_led(void)
 
 void app_start(void)
 {
-    ESP_LOGW("BOOT", "Reset reason: %d | Free heap: %lu",
-             esp_reset_reason(), (unsigned long)esp_get_free_heap_size());
-
-    /* 0. Khoa cau H ngay khi boot */
+    /* 0. Khóa cầu H ngay khi boot */
     motor_init();
     motor_stop_all_coast();
 
@@ -418,18 +477,23 @@ void app_start(void)
     gpio_set_direction(PIN_USER_LED, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_USER_LED, 0);
 
-    /* 1. Cua so OTA (15 giay) */
+    /* Cấp phát động 1 lần (6000 * 14 = 84 KB) tránh vượt vùng .bss tĩnh */
+    s_log_buf = (log_sample_t *)calloc(LOG_MAX_SAMPLES, sizeof(log_sample_t));
+    if (!s_log_buf) {
+        ESP_LOGE(TAG, "Khong du RAM cap phat log buffer!");
+        return;
+    }
+
+    /* 1. Giữ nguyên cửa sổ OTA qua Wi-Fi */
     wifi_ap_init_base();
     ota_boot_window();
 
-    /* 2. Bat SoftAP rieng cho SysID va mo HTTP server cong 8080 */
+    /* 2. Bật SoftAP SysID và mở HTTP server trên Core 0 */
     if (ensure_wifi_ap_online()) {
-        start_sysid_http_server();
+        start_http_server();
         blink_ready_led();
-    } else {
-        ESP_LOGE(TAG, "Khong the bat Wi-Fi SysID!");
     }
 
-    /* 3. Task lay mau 200 Hz tren Core 1 */
-    xTaskCreatePinnedToCore(sysid_rt_task, "sysid_rt", 4096, NULL, 20, &s_rt_task_handle, 1);
+    /* 3. Chạy vòng điều khiển 200 Hz độc quyền trên Core 1 */
+    xTaskCreatePinnedToCore(rt_control_task, "rt_ctrl", 4096, NULL, 20, &s_rt_task_handle, 1);
 }
