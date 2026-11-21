@@ -3,28 +3,22 @@ idf_component_register(
         "main.c"
         "../boot/ota.c"
         "../components/application/app.c"
-
-        "../components/service/loadcell_service.c"
-        "../components/driver/hx711.c"
-        "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
-        # "../components/driver/motor.c"   # uncomment once motor.c is ready
-        
     INCLUDE_DIRS
         "."
         "../boot"
-
         "../components/application"
-        "../components/service/include"
         "../components/driver/include"
-
     REQUIRES
         esp_driver_gpio
+        nvs_flash
         esp_wifi
         esp_netif
         esp_event
         esp_http_server
-        nvs_flash
         app_update
+        esp_timer
+        driver
+        lwip
     PRIV_REQUIRES esp_rom
 )

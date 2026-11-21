@@ -17,13 +17,13 @@ esp_err_t wifi_ap_init_base(void)
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
+        ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     if (err != ESP_OK) return err;
 
     err = esp_netif_init();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
 
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
@@ -49,7 +49,7 @@ esp_err_t wifi_ap_on(const char *ssid, const char *pass)
     wifi_config_t ap = { 0 };
     strncpy((char *)ap.ap.ssid, ssid, sizeof(ap.ap.ssid) - 1);
     strncpy((char *)ap.ap.password, pass, sizeof(ap.ap.password) - 1);
-    ap.ap.ssid_len       = strlen(ssid);
+    ap.ap.ssid_len       = (uint8_t)strlen(ssid);
     ap.ap.channel        = 1;
     ap.ap.max_connection = 2;
     ap.ap.authmode       = WIFI_AUTH_WPA2_PSK;
@@ -62,6 +62,9 @@ esp_err_t wifi_ap_on(const char *ssid, const char *pass)
         esp_wifi_deinit();
         return err;
     }
+
+    /* Bắt buộc tắt power-save để giữ jitter thấp cho HIL 200 Hz */
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     s_radio_on = true;
     return ESP_OK;
