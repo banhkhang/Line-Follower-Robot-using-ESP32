@@ -1,68 +1,45 @@
 #pragma once
 
-/*
- * config.h - the ONE place for pins and tunable numbers.
- *
- * If you change a wire on the PCB, change it here and nowhere else.
- * Pin names follow the schematic (ESP32-WROOM custom board).
- */
+/* ---------------- Motor Driver (DRV8871 + 6N137) ---------------- */
+#define PIN_MOTOR_A1        12      /* PWMA1 (strapping pin, LOW at boot) */
+#define PIN_MOTOR_A2        13      /* PWMA2 */
+#define PIN_MOTOR_B1        16      /* PWMB1 */
+#define PIN_MOTOR_B2        15      /* PWMB2 (strapping pin) */
 
-/* ------------------------------------------------------------------ */
-/* Load cell (HX711)                                                   */
-/* ------------------------------------------------------------------ */
-#define PIN_HX711_DOUT   14   /* schematic net "DOUT"   */
-#define PIN_HX711_SCK    27   /* schematic net "PD_SCK" */
+#define MOTOR_PWM_FREQ_HZ   10000   /* 10 kHz */
+#define MOTOR_PWM_RES_BITS  12      /* 12-bit: 0..4095 */
+#define MOTOR_PWM_MAX_DUTY  ((1U << MOTOR_PWM_RES_BITS) - 1U)
 
-#define LOADCELL_SAMPLES     5      /* readings averaged per update (HX711 = 10 per second) */
-#define LOADCELL_TIMEOUT_MS  1000   /* give up if the HX711 does not answer in this time    */
+/* ---------------- Encoders (Quadrature 4x) ---------------- */
+#define PIN_ENC_A_A         21      /* ENCA-A */
+#define PIN_ENC_A_B         19      /* ENCA-B */
+#define PIN_ENC_B_A         18      /* ENCB-A */
+#define PIN_ENC_B_B         17      /* ENCB-B */
 
-/*
- * Counts per gram. Leave at 1.0 until you calibrate (see README).
- * While it is 1.0 the "grams" printed on the serial monitor are just raw counts.
- */
-#define LOADCELL_SCALE   1.0f
+/* Số xung 4x mỗi vòng trục bánh xe (Sửa lại theo động cơ thực tế)
+ * Ví dụ: encoder 11 PPR, hộp số 1:30 -> 11 * 30 * 4 = 1320.0f */
+#define ENC_CPR_A           1320.0f
+#define ENC_CPR_B           1320.0f
 
-/* ------------------------------------------------------------------ */
-/* Line sensor array (7x TCRT5000), analog inputs                      */
-/* ------------------------------------------------------------------ */
-#define PIN_SENSOR_1     36   /* A1 - ADC1_CH0 (input only) */
-#define PIN_SENSOR_2     39   /* A2 - ADC1_CH3 (input only) */
-#define PIN_SENSOR_3     34   /* A3 - ADC1_CH6 (input only) */
-#define PIN_SENSOR_4     35   /* A4 - ADC1_CH7 (input only) */
-#define PIN_SENSOR_5     32   /* A5 - ADC1_CH4 */
-#define PIN_SENSOR_6     33   /* A6 - ADC1_CH5 */
-#define PIN_SENSOR_7     25   /* A7 - ADC2_CH8 (ADC2 cannot be used while Wi-Fi is on) */
-#define PIN_SENSOR_CTRL  26   /* schematic net "CTRL" - assumed sensor emitter enable, please verify */
+/* Đảo dấu (+1 hoặc -1) nếu chiều quay dương PWM cho RPM âm */
+#define ENC_DIR_A           (+1)
+#define ENC_DIR_B           (+1)
 
-/* ------------------------------------------------------------------ */
-/* Motor driver (2 channels, 2 PWM inputs each) and encoders           */
-/* ------------------------------------------------------------------ */
-#define PIN_MOTOR_A1     12   /* PWMA1 - strapping pin, must be LOW at boot */
-#define PIN_MOTOR_A2     13   /* PWMA2 */
-#define PIN_MOTOR_B1     16   /* PWMB1 */
-#define PIN_MOTOR_B2     15   /* PWMB2 - strapping pin */
+/* ---------------- User I/O ---------------- */
+#define PIN_USER_LED        2       /* USR_LED trên PCB */
+#define PIN_BOOT_BUTTON     0       /* BOOT button (active LOW) */
 
-#define PIN_ENC_A_A      21   /* ENCA-A */
-#define PIN_ENC_A_B      19   /* ENCA-B */
-#define PIN_ENC_B_A      18   /* ENCB-A */
-#define PIN_ENC_B_B      17   /* ENCB-B */
+/* ---------------- OTA ---------------- */
+#define OTA_WINDOW_MS       30000           /* 15 giây chờ nạp OTA sau reset */
+#define OTA_WIFI_SSID       "LineRobot-OTA"
+#define OTA_WIFI_PASS       "12345678"
 
-/* ------------------------------------------------------------------ */
-/* User I/O                                                            */
-/* ------------------------------------------------------------------ */
-#define PIN_USER_LED      2   /* USR_LED (strapping pin) */
-//#define PIN_USER_BUTTON   4   /* USR_BTN, external pull-up, pressed = LOW */
+/* ---------------- SysID Wi-Fi & HTTP Server ---------------- */
+#define SYSID_WIFI_SSID     "LineRobot-SYSID"
+#define SYSID_WIFI_PASS     "12345678"
+#define SYSID_HTTP_PORT     8080
 
-/* ---------------- OTA (wireless update) ---------------- */
-#define PIN_BOOT_BUTTON   0        /* BOOT button, pressed = LOW (press it AFTER reset, not during) */
-#define OTA_WINDOW_MS     100000    /* how long to wait for an upload after reset */
-#define OTA_WIFI_SSID     "LineRobot-OTA"
-#define OTA_WIFI_PASS     "12345678"   /* at least 8 characters */
-
-/* ---------------- Telemetry (wireless log) ---------------- */
-#define USE_TELEMETRY         1             /* 0 = no Wi-Fi at all while the robot runs */
-#define TELEMETRY_WIFI_SSID   "LineRobot-LOG"
-#define TELEMETRY_WIFI_PASS   "12345678"
-#define TELEMETRY_PORT        5000
-#define TELEMETRY_DEST_IP     "192.168.4.255"   /* broadcast: any PC on this Wi-Fi hears it */
-#define TELEMETRY_ALSO_UART   1                 /* 1 = also print on the USB cable (debugging) */
+/* ---------------- SysID Sampling & HTTP Server ---------------- */
+#define SYSID_FS_HZ         200             /* Tần số lấy mẫu 200 Hz */
+#define SYSID_TS_US         5000            /* Chu kỳ 5000 us */
+#define SYSID_MAX_SAMPLES   6000            /* 30 s * 200 Hz = 6000 mẫu (72 KB) */
