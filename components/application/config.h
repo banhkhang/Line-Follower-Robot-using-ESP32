@@ -36,19 +36,14 @@
 #define M_CHASSIS_KG           2.0f     /* Khối lượng xe rỗng                 */
 
 /* 0.140f cho Simulink read_sensors; đổi sang 0.075f khi chạy xe thật */
-#define SENSOR_LOOKAHEAD_M     0.140f
+#define SENSOR_LOOKAHEAD_M     0.075f
 
-/* ------------------------------------------------------------------ */
-/* Crossbar (vạch ngang trạm tải hàng / đích) & Mission Timing        */
-/* ------------------------------------------------------------------ */
-#define CROSSBAR_SENSOR_TH      0.35f   /* Ngưỡng cường độ chuẩn hóa mỗi mắt IR (sau trừ nền) */
-#define CROSSBAR_MIN_ACTIVE     5       /* Tối thiểu 5/7 mắt cùng thấy vạch ngang */
-#define CROSSBAR_DEBOUNCE_SEC   0.030f  /* Duy trì 30 ms (6 chu kỳ 200 Hz) để xác nhận vạch ngang */
-
-#define LOAD_STOP_DWELL_SEC     2.0f    /* Thời gian dừng tại trạm tải hàng [s] */
-#define CROSSBAR_CLEAR_SEC      0.60f   /* Thời gian chạy thẳng vượt qua vạch ngang trạm tải [s] */
-#define GOAL_ARM_DELAY_SEC      2.0f    /* Thời gian khóa nhận diện vạch đích sau khi rời trạm tải [s] */
-#define LINE_LOSS_STOP_SEC      2.0f    /* Dừng khẩn cấp trên ESP nếu mất line liên tục 2 s */
+/* Crossbar & Loading Station */
+#define CROSSBAR_SENSOR_TH      0.35f
+#define CROSSBAR_MIN_ACTIVE     5
+#define CROSSBAR_DEBOUNCE_SEC   0.020f   /* 4 chu kỳ (20 ms / 52 ms bề rộng vạch) */
+#define LOAD_APPROACH_DIST_M    0.160f   /* Tiến thêm 160 mm + 47 mm phanh => dừng tại X ~ 1008 mm */
+#define LOAD_STOP_DWELL_SEC     2.0f     /* Chờ nhận tải 2.0 s trong vùng [850, 1150] */
 
 /* ------------------------------------------------------------------ */
 /* HIL Run Mode Selection                                             */
@@ -56,7 +51,37 @@
 #define MODE_LINE_FOLLOW       0   /* Chế độ bám line đầy đủ */
 #define MODE_INNER_STEP_TEST   1   /* Bước 1: Chỉ test vòng trong (S-curve + bậc thang) */
 
-#define HIL_RUN_MODE           MODE_INNER_STEP_TEST
+#define HIL_RUN_MODE           MODE_LINE_FOLLOW
+
+/* Outer-Loop Gains (Step 2 - tăng độ cứng bám chuyển tiếp cung, Ls = 0.075 m) */
+#define V_CRUISE_MAX            0.50f
+#define V_CRUISE_MIN            0.30f
+#define V_WHEEL_MIN             0.00f
+#define V_WHEEL_MAX             0.75f
+#define OMEGA_MAX_RADS          4.50f
+#define LONGITUDINAL_ACCEL_MAX  1.80f    /* Chỉ giới hạn gia tốc dài của xe, không bóp lực lái */
+
+#define K1_KINEMATIC            4.50f    /* Tăng từ 2.50 -> 4.50 */
+#define K_SMC_GAIN              0.075f   /* Tăng từ 0.045 -> 0.075 */
+#define PHI_BL_M                0.012f   /* Thu hẹp lớp biên 0.015 -> 0.012 (K_tot = 10.75 s^-1) */
+#define KD_RATE_SEC             0.030f   /* Tăng tắt dần đạo hàm */
+#define KI_SMC_GAIN             2.50f
+#define Z_INT_MAX_M             0.006f
 
 /* Băng thông thiết kế vòng trong [rad/s] (chỉnh duy nhất số này khi tune PI) */
 #define INNER_LOOP_WGC         30.0f
+
+/* ------------------------------------------------------------------ */
+/* Two-Stage Goal Stopping (X = 3000 mm, no goal crossbar)            */
+/* ------------------------------------------------------------------ */
+#define GOAL_ARM_DIST_M         4.400f   /* Mở khóa EOL trên đoạn thẳng cuối (X ~ 2500 mm) */
+#define GOAL_DECEL_START_M      4.600f   /* Bắt đầu giảm tốc về v_creep (X ~ 2701 mm)      */
+#define GOAL_CREEP_SPEED_MS     0.08f    /* Tốc độ bò tiếp cận mép hết line [m/s]          */
+#define GOAL_DECEL_RATE_MS2     1.00f    /* Gia tốc giảm tốc tầng 1 [m/s^2]                */
+#define GOAL_STEER_FREEZE_I     1.20f    /* Khóa lái thẳng khi total_I sụt qua mép line    */
+
+#define GOAL_EOL_DEBOUNCE_SEC   0.010f   /* 2 chu kỳ (10 ms) xác nhận hết line cả 7 mắt    */
+#define GOAL_EOL_OFFSET_M       0.0708f  /* 75.0 mm (X_sens) - 4.2 mm (PSF + 10 ms deb)    */
+#define GOAL_FINAL_DECEL_MS2    0.12f    /* Độ dốc quỹ đạo sqrt(2*a*d_rem) tầng 2 [m/s^2]  */
+#define GOAL_MIN_CREEP_MS       0.025f   /* Tốc độ bò tối thiểu trước khi đóng Short Brake */
+#define GOAL_STOP_BAND_M        0.0006f  /* Đóng Short Brake khi còn <= 0.6 mm             */

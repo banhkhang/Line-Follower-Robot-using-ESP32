@@ -24,9 +24,11 @@ static const char *TAG = "hil_app";
 /* ============================================================================
  * 1. SENSOR, MOTOR, OBSERVER & SMC CONSTANTS
  * ============================================================================ */
-static const float Y_SENS_M[7]      = {0.030f, 0.020f, 0.010f, 0.000f, -0.010f, -0.020f, -0.030f};
-static const float OPT_SIGMA_M      = 0.006f;
-static const float ADC_NOISE_FLOOR  = 0.085f;
+static const float Y_SENS_M[7]       = {0.030f, 0.020f, 0.010f, 0.000f, -0.010f, -0.020f, -0.030f};
+static const float LINE_HALF_WIDTH_M = 0.013f;   /* Băng keo rộng 26 mm (a = 13 mm) */
+static const float OPT_SIGMA_PSF_M   = 0.0035f;  /* PSF TCRT5000 ở độ cao 5 mm      */
+static const float ADC_NOISE_FLOOR   = 0.085f;
+static const float LINE_LOSS_STOP_SEC = 2.0f;   /* Dừng khẩn cấp khi mất line liên tục >= 2 s */
 
 /* Bench-identified JGB37-520 (333 RPM) 2-DOF PI gains */
 static const float KFF_GAIN         = 86.23f;
@@ -79,18 +81,32 @@ static inline uint32_t get_time_ms(void)
 /* ============================================================================
  * 3. GAUSS-NEWTON SINGLE-LINE TEMPLATE MATCHER (Y-JUNCTION)
  * ============================================================================ */
-static inline float eval_single_line_template(float y_pos, float e_center)
+static inline void eval_single_line_template_26mm(
+    float y_pos, float e_center, float *T_out, float *dT_out)
 {
-    float dist = y_pos - e_center;
-    float val  = expf(-(dist * dist) / (2.0f * OPT_SIGMA_M * OPT_SIGMA_M)) - ADC_NOISE_FLOOR;
-    return (val > 0.0f) ? val : 0.0f;
+    const float inv_sqrt2_sig   = 1.0f / (1.41421356f * OPT_SIGMA_PSF_M);
+    const float inv_sqrt2pi_sig = 1.0f / (2.50662827f * OPT_SIGMA_PSF_M);
+
+    float d  = y_pos - e_center;
+    float u1 = (LINE_HALF_WIDTH_M - d) * inv_sqrt2_sig;
+    float u2 = (LINE_HALF_WIDTH_M + d) * inv_sqrt2_sig;
+
+    float raw = 0.5f * (erff(u1) + erff(u2)) - ADC_NOISE_FLOOR;
+    if (raw > 0.0f) {
+        *T_out  = raw;
+        *dT_out = inv_sqrt2pi_sig * (expf(-u1 * u1) - expf(-u2 * u2));
+    } else {
+        *T_out  = 0.0f;
+        *dT_out = 0.0f;
+    }
 }
 
 static bool compute_lateral_error_gauss_newton(
     const uint16_t adc[7],
     uint8_t mass_kg,
     float e_pred_m,
-    float *e_lat_out_m)
+    float *e_lat_out_m,
+    float *total_I_out)
 {
     float I_eff[7];
     float total_I = 0.0f;
@@ -113,6 +129,10 @@ static bool compute_lateral_error_gauss_newton(
         }
     }
 
+    if (total_I_out != NULL) {
+        *total_I_out = total_I;
+    }
+
     if (total_I < 0.15f) {
         return false;
     }
@@ -123,32 +143,32 @@ static bool compute_lateral_error_gauss_newton(
     }
     float e_centroid = weighted_sum / total_I;
 
-    if (num_clusters < 2 && total_I <= 1.65f) {
+    /* Khi mass_kg == 0 (chưa qua trạm tải) hoặc còn là 1 line đơn 26 mm (total_I <= 2.65)
+     * thì bám theo tâm hình học, tránh bị vạch ngang trạm tải kéo lệch. */
+    if (mass_kg == 0 || (num_clusters < 2 && total_I <= 2.65f)) {
         *e_lat_out_m = e_centroid;
         return true;
     }
 
     float branch_sign = (mass_kg == 1) ? 1.0f : -1.0f;
     float e_est = e_pred_m + branch_sign * 0.0025f;
-    const float eps_e = 0.0001f;
 
     for (int iter = 0; iter < 3; iter++) {
         float sum_w_dT2    = 1e-6f;
         float sum_w_dT_res = 0.0f;
 
         for (int k = 0; k < 7; k++) {
-            float T0 = eval_single_line_template(Y_SENS_M[k], e_est);
-            float Tp = eval_single_line_template(Y_SENS_M[k], e_est + eps_e);
-            float Tm = eval_single_line_template(Y_SENS_M[k], e_est - eps_e);
-            float dT = (Tp - Tm) / (2.0f * eps_e);
+            float T0 = 0.0f, dT = 0.0f;
+            eval_single_line_template_26mm(Y_SENS_M[k], e_est, &T0, &dT);
 
             float res = I_eff[k] - T0;
             float w = 1.0f;
 
+            /* Ưu tiên khóa vào mép ngoài sạch của nhánh mục tiêu, triệt ảnh hưởng nhánh còn lại */
             float side_pos = branch_sign * (Y_SENS_M[k] - e_est);
-            if (side_pos < -0.006f && res > 0.03f) {
+            if (side_pos < -0.008f && res > 0.03f) {
                 w = 0.0f;
-            } else if (side_pos < 0.002f && res > 0.04f) {
+            } else if (side_pos < 0.000f && res > 0.04f) {
                 w = 0.15f;
             }
 
@@ -170,12 +190,14 @@ static bool compute_lateral_error_gauss_newton(
 }
 
 typedef enum {
-    MISSION_TO_LOAD = 0,     /* Chạy từ điểm xuất phát tới trạm tải hàng */
-    MISSION_WAIT_LOAD,       /* Dừng tại vạch ngang trạm tải hàng để nhận tải */
-    MISSION_LEAVE_LOAD,      /* Chạy thẳng vượt qua vạch ngang trạm tải */
-    MISSION_TO_GOAL,         /* Bám line + tách nhánh Y theo khối lượng tới đích */
-    MISSION_STOPPED_GOAL,    /* Đã dừng hẳn tại vạch ngang đích */
-    MISSION_STOPPED_LOST     /* Đã dừng hẳn do mất line liên tục >= 2 s */
+    MISSION_TO_LOAD = 0,     /* Chạy từ điểm xuất phát tới vạch ngang trạm tải */
+    MISSION_APPROACH_LOAD,   /* Tiến thêm 160 mm sau khi thấy vạch ngang vào tâm vùng tải */
+    MISSION_WAIT_LOAD,       /* Dừng Short Brake tại tâm vùng tải (X ~ 1005 mm) chờ nhận tải */
+    MISSION_TO_GOAL,         /* Bám line + tách nhánh Y tới đoạn thẳng cuối */
+    MISSION_GOAL_APPROACH,   /* Tầng 1: giảm tốc về 0.08 m/s & chờ sự kiện hết line (EOL) */
+    MISSION_GOAL_FINAL_STOP, /* Tầng 2: bò thẳng 70.8 mm theo quỹ đạo sqrt -> Short Brake */
+    MISSION_STOPPED_GOAL,    /* Đã dừng hẳn tại đích X = 3000 mm */
+    MISSION_STOPPED_LOST     /* Dừng khẩn cấp do mất line liên tục >= 2 s */
 } mission_state_t;
 
 /* Phát hiện vạch ngang: >= CROSSBAR_MIN_ACTIVE mắt cảm biến cùng vượt ngưỡng */
@@ -266,6 +288,13 @@ static float motor_pi_update(mass_adaptive_pi_t *pi, float v_ref_target, float v
     float tau_eff = TAU_0_SEC + GAMMA_INERTIA * m_total;
     float alpha_m = tau_eff / TAU_0_SEC;
 
+    /* Không kẹp slew-rate từng bánh để tránh trễ pha lệnh lái vi sai (v_base đã được ramp) */
+    float v_ref = v_ref_target;
+    pi->v_ref_shaped = v_ref_target;
+
+    float err = v_ref - v_meas;
+    /* ... giữ nguyên toàn bộ phần tính kp_eff, ki_eff, u_ff, anti-windup phía dưới ... */
+
     /* Khi chạy STEP TEST tắt slew-rate để đo chính xác đáp ứng bậc thang Ts, OS% */
 #if HIL_RUN_MODE == MODE_INNER_STEP_TEST
     float v_ref = v_ref_target;
@@ -277,10 +306,10 @@ static float motor_pi_update(mass_adaptive_pi_t *pi, float v_ref_target, float v
     if (dv > max_dv)       dv = max_dv;
     else if (dv < -max_dv) dv = -max_dv;
     pi->v_ref_shaped += dv;
-    float v_ref = pi->v_ref_shaped;
+    v_ref = pi->v_ref_shaped;
 #endif
 
-    float err = v_ref - v_meas;
+    err = v_ref - v_meas;
 
     /* Khử cực đối tượng: zI = 1 / tau_eff => PM không đổi theo khối lượng */
     float kp_eff   = INNER_LOOP_WGC * tau_eff * KFF_GAIN;
@@ -373,6 +402,12 @@ typedef struct {
     float crossbar_timer;
     float state_timer;
     float line_loss_timer;
+    float load_dist_m;
+    float ramp_timer;
+    float v_base_shaped;
+    float s_from_crossbar;
+    float eol_timer;
+    float goal_creep_dist_m;
 } hil_ctrl_ctx_t;
 
 static void hil_ctx_reset(hil_ctrl_ctx_t *ctx)
@@ -392,6 +427,12 @@ static void hil_ctx_reset(hil_ctrl_ctx_t *ctx)
     ctx->crossbar_timer  = 0.0f;
     ctx->state_timer     = 0.0f;
     ctx->line_loss_timer = 0.0f;
+    ctx->load_dist_m       = 0.0f;
+    ctx->ramp_timer        = 0.0f;
+    ctx->v_base_shaped     = 0.0f;
+    ctx->s_from_crossbar   = 0.0f;
+    ctx->eol_timer         = 0.0f;
+    ctx->goal_creep_dist_m = 0.0f;
 }
 
 /* Thực hiện đúng 1 bước điều khiển Ts = 0.005 s đồng bộ 1:1 với gói UDP từ Simulink */
@@ -414,15 +455,37 @@ static void hil_control_step(
     *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref, vL_meas, m_total);
     *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref, vR_meas, m_total);
 #else
-    /* Chế độ bám line (Bước 2 & 3) dùng cùng ngữ cảnh ctx */
     ctx->state_timer += TS_SEC;
+    ctx->ramp_timer  += TS_SEC;
+
+    float v_act = 0.5f * (vR_meas + vL_meas);
+    float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
+
+    /* Tích lũy odometry liên tục từ thời điểm xác nhận vạch ngang trạm tải */
+    if (ctx->mission_state >= MISSION_APPROACH_LOAD &&
+        ctx->mission_state <= MISSION_GOAL_APPROACH) {
+        ctx->s_from_crossbar += fmaxf(v_act, 0.0f) * TS_SEC;
+    }
+
+    /* Các trạng thái đã dừng hẳn: giữ Short Brake (0% PWM) */
+    if (ctx->mission_state == MISSION_STOPPED_GOAL ||
+        ctx->mission_state == MISSION_STOPPED_LOST) {
+        *pwmL_out = 0.0f;
+        *pwmR_out = 0.0f;
+        motor_pi_reset(&ctx->motor_ctrl_L);
+        motor_pi_reset(&ctx->motor_ctrl_R);
+        return;
+    }
+
     bool crossbar_raw = is_crossbar_detected(adc_local);
     ctx->crossbar_timer = crossbar_raw ? (ctx->crossbar_timer + TS_SEC) : 0.0f;
     bool crossbar_confirmed = (ctx->crossbar_timer >= CROSSBAR_DEBOUNCE_SEC);
 
     float e2_pred = ctx->e2_filt + ctx->de2_filt * TS_SEC;
     float e2_raw  = e2_pred;
-    bool  line_ok = compute_lateral_error_gauss_newton(adc_local, mass_local, e2_pred, &e2_raw);
+    float total_I = 0.0f;
+    bool  line_ok = compute_lateral_error_gauss_newton(
+                        adc_local, mass_local, e2_pred, &e2_raw, &total_I);
 
     if (!ctx->was_active && line_ok) {
         ctx->e2_filt     = e2_raw;
@@ -431,8 +494,6 @@ static void hil_control_step(
         ctx->was_active  = true;
     }
 
-    float v_act = 0.5f * (vR_meas + vL_meas);
-    float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
     if (line_ok) {
         float res     = e2_raw - e2_pred;
         ctx->e2_filt  = e2_pred + ctx->alpha_ab * res;
@@ -443,26 +504,173 @@ static void hil_control_step(
     }
     observer_update(&ctx->observer, ctx->e2_filt, v_act, w_act);
 
-    float v_ramp   = V_CRUISE_MAX * fminf(1.0f, ctx->active_time / 0.25f);
-    float err_norm = fminf(fabsf(ctx->e2_filt) / 0.024f, 1.0f);
-    float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
-    float v_base   = fminf(v_ramp, v_turn);
+    /* Dừng khẩn cấp nếu mất line liên tục >= 2 s (trừ giai đoạn chờ tải & bò đích) */
+    if (ctx->mission_state != MISSION_WAIT_LOAD &&
+        ctx->mission_state != MISSION_GOAL_FINAL_STOP) {
+        ctx->line_loss_timer = line_ok ? 0.0f : (ctx->line_loss_timer + TS_SEC);
+        if (ctx->line_loss_timer >= LINE_LOSS_STOP_SEC) {
+            ctx->mission_state = MISSION_STOPPED_LOST;
+            *pwmL_out = 0.0f;
+            *pwmR_out = 0.0f;
+            motor_pi_reset(&ctx->motor_ctrl_L);
+            motor_pi_reset(&ctx->motor_ctrl_R);
+            ESP_LOGW(TAG, "Line lost >= %.1f s -> Emergency Short Brake", LINE_LOSS_STOP_SEC);
+            return;
+        }
+    }
 
-    if (ctx->active_time > 0.25f && line_ok) {
+    /* ---- Máy trạng thái nhiệm vụ (Trạm tải + Đích 2 tầng) ---- */
+    switch (ctx->mission_state) {
+        case MISSION_TO_LOAD:
+            if (ctx->active_time > 0.5f && crossbar_confirmed) {
+                ctx->mission_state   = MISSION_APPROACH_LOAD;
+                ctx->load_dist_m     = 0.0f;
+                ctx->s_from_crossbar = 0.0f;
+                ctx->state_timer     = 0.0f;
+                ESP_LOGI(TAG, "Crossbar detected -> approaching loading center");
+            }
+            break;
+
+        case MISSION_APPROACH_LOAD:
+            ctx->load_dist_m += fmaxf(v_act, 0.0f) * TS_SEC;
+            if (ctx->load_dist_m >= LOAD_APPROACH_DIST_M) {
+                ctx->mission_state = MISSION_WAIT_LOAD;
+                ctx->state_timer   = 0.0f;
+                motor_pi_reset(&ctx->motor_ctrl_L);
+                motor_pi_reset(&ctx->motor_ctrl_R);
+                ctx->z_int_smc     = 0.0f;
+                ctx->v_base_shaped = 0.0f;
+                ESP_LOGI(TAG, "Loading center reached -> Short Brake & dwell %.1f s",
+                         LOAD_STOP_DWELL_SEC);
+            }
+            break;
+
+        case MISSION_WAIT_LOAD:
+            *pwmL_out = 0.0f;
+            *pwmR_out = 0.0f;
+            motor_pi_reset(&ctx->motor_ctrl_L);
+            motor_pi_reset(&ctx->motor_ctrl_R);
+            ctx->z_int_smc     = 0.0f;
+            ctx->v_base_shaped = 0.0f;
+            observer_reset(&ctx->observer, ctx->e2_filt);
+
+            if (ctx->state_timer >= LOAD_STOP_DWELL_SEC) {
+                ctx->mission_state = MISSION_TO_GOAL;
+                ctx->state_timer   = 0.0f;
+                ctx->ramp_timer    = 0.0f;
+                ESP_LOGI(TAG, "Departing loading zone (mass = %u kg, s_cb = %.3f m)",
+                         mass_local, ctx->s_from_crossbar);
+            }
+            return;
+
+        case MISSION_TO_GOAL:
+            if (ctx->s_from_crossbar >= GOAL_DECEL_START_M) {
+                ctx->mission_state = MISSION_GOAL_APPROACH;
+                ctx->eol_timer     = 0.0f;
+                ctx->state_timer   = 0.0f;
+                ESP_LOGI(TAG, "Stage 1 Goal Approach (s_cb = %.3f m) -> decel to %.2f m/s",
+                         ctx->s_from_crossbar, GOAL_CREEP_SPEED_MS);
+            } else if (ctx->s_from_crossbar >= GOAL_ARM_DIST_M && !line_ok) {
+                /* Dự phòng trường hợp odometry chậm hơn thực tế và gặp EOL sớm */
+                ctx->eol_timer += TS_SEC;
+                if (ctx->eol_timer >= GOAL_EOL_DEBOUNCE_SEC) {
+                    ctx->mission_state     = MISSION_GOAL_FINAL_STOP;
+                    ctx->goal_creep_dist_m = 0.0f;
+                    ctx->state_timer       = 0.0f;
+                    ESP_LOGI(TAG, "Early EOL latched (s_cb = %.3f m) -> Stage 2 final creep",
+                             ctx->s_from_crossbar);
+                }
+            } else {
+                ctx->eol_timer = 0.0f;
+            }
+            break;
+
+        case MISSION_GOAL_APPROACH:
+            ctx->eol_timer = (!line_ok) ? (ctx->eol_timer + TS_SEC) : 0.0f;
+            if (ctx->eol_timer >= GOAL_EOL_DEBOUNCE_SEC) {
+                ctx->mission_state     = MISSION_GOAL_FINAL_STOP;
+                ctx->goal_creep_dist_m = 0.0f;
+                ctx->state_timer       = 0.0f;
+                ESP_LOGI(TAG, "EOL latched (s_cb = %.3f m, v = %.3f m/s) -> Stage 2 creep %.1f mm",
+                         ctx->s_from_crossbar, v_act, GOAL_EOL_OFFSET_M * 1000.0f);
+            }
+            break;
+
+        case MISSION_GOAL_FINAL_STOP:
+        default:
+            break;
+    }
+
+    /* ---- Tầng 2: Bò thẳng chính xác 70.8 mm theo quỹ đạo sqrt -> Short Brake ---- */
+    if (ctx->mission_state == MISSION_GOAL_FINAL_STOP) {
+        ctx->goal_creep_dist_m += fmaxf(v_act, 0.0f) * TS_SEC;
+        float d_rem = GOAL_EOL_OFFSET_M - ctx->goal_creep_dist_m;
+
+        if (d_rem <= GOAL_STOP_BAND_M) {
+            ctx->mission_state = MISSION_STOPPED_GOAL;
+            ctx->state_timer   = 0.0f;
+            *pwmL_out = 0.0f;
+            *pwmR_out = 0.0f;
+            motor_pi_reset(&ctx->motor_ctrl_L);
+            motor_pi_reset(&ctx->motor_ctrl_R);
+            ESP_LOGI(TAG, "GOAL STOPPED (s_cb = %.3f m, creep = %.1f mm)",
+                     ctx->s_from_crossbar, ctx->goal_creep_dist_m * 1000.0f);
+            return;
+        }
+
+        float v_prof  = sqrtf(2.0f * GOAL_FINAL_DECEL_MS2 * fmaxf(d_rem, 0.0f));
+        float v_cmd   = fminf(GOAL_CREEP_SPEED_MS, fmaxf(v_prof, GOAL_MIN_CREEP_MS));
+        float m_total = M_CHASSIS_KG + (float)mass_local;
+
+        *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_cmd, vL_meas, m_total);
+        *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_cmd, vR_meas, m_total);
+        return;
+    }
+
+    /* ---- Vòng ngoài bám line (gồm cả Tầng 1 giảm tốc tiếp cận đích) ---- */
+    float v_target = 0.0f;
+    float decel_limit = LONGITUDINAL_ACCEL_MAX;
+
+    if (ctx->mission_state == MISSION_GOAL_APPROACH) {
+        v_target    = GOAL_CREEP_SPEED_MS;
+        decel_limit = GOAL_DECEL_RATE_MS2;
+    } else {
+        float v_ramp   = V_CRUISE_MAX * fminf(1.0f, ctx->ramp_timer / 0.35f);
+        float err_norm = fminf(fabsf(ctx->e2_filt) / 0.024f, 1.0f);
+        float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
+        v_target       = fminf(v_ramp, v_turn);
+    }
+
+    float max_dv_up   = LONGITUDINAL_ACCEL_MAX * TS_SEC;
+    float max_dv_down = decel_limit * TS_SEC;
+    float dv_lon      = v_target - ctx->v_base_shaped;
+    if (dv_lon > max_dv_up)         dv_lon = max_dv_up;
+    else if (dv_lon < -max_dv_down) dv_lon = -max_dv_down;
+    ctx->v_base_shaped += dv_lon;
+    float v_base = ctx->v_base_shaped;
+
+    if (ctx->ramp_timer > 0.25f && line_ok && ctx->mission_state != MISSION_GOAL_APPROACH) {
         ctx->z_int_smc += KI_SMC_GAIN * ctx->e2_filt * TS_SEC;
         if (ctx->z_int_smc > Z_INT_MAX_M)  ctx->z_int_smc = Z_INT_MAX_M;
         if (ctx->z_int_smc < -Z_INT_MAX_M) ctx->z_int_smc = -Z_INT_MAX_M;
+    } else if (ctx->mission_state == MISSION_GOAL_APPROACH) {
+        ctx->z_int_smc *= 0.95f;
     }
+
     float de2_clean = (ctx->e2_filt - ctx->e2_prev_smc) / TS_SEC;
     ctx->e2_prev_smc = ctx->e2_filt;
 
-    float sigma     = ctx->e2_filt + KD_RATE_SEC * de2_clean + ctx->z_int_smc;
-    float sat_sigma = fminf(fmaxf(sigma / PHI_BL_M, -1.0f), 1.0f);
-    float alpha_str = fminf(1.0f, fmaxf(0.15f, v_base / V_CRUISE_MAX));
-    float w_raw     = (v_base * sinf(ctx->observer.e3_hat)
-                      + alpha_str * (K1_KINEMATIC * ctx->e2_filt + K_SMC_GAIN * sat_sigma))
-                      / SENSOR_LOOKAHEAD_M;
-    w_raw = fminf(fmaxf(w_raw, -OMEGA_MAX_RADS), OMEGA_MAX_RADS);
+    float w_raw = 0.0f;
+    /* Khi sắp chạm mép hết line ở Tầng 1, khóa lái thẳng để nhiễu cạnh không làm lệch hướng */
+    if (!(ctx->mission_state == MISSION_GOAL_APPROACH && total_I < GOAL_STEER_FREEZE_I)) {
+        float sigma     = ctx->e2_filt + KD_RATE_SEC * de2_clean + ctx->z_int_smc;
+        float sat_sigma = fminf(fmaxf(sigma / PHI_BL_M, -1.0f), 1.0f);
+        float alpha_str = fminf(1.0f, fmaxf(0.20f, v_base / V_CRUISE_MAX));
+        w_raw = (v_base * sinf(ctx->observer.e3_hat)
+                + alpha_str * (K1_KINEMATIC * ctx->e2_filt + K_SMC_GAIN * sat_sigma))
+                / SENSOR_LOOKAHEAD_M;
+        w_raw = fminf(fmaxf(w_raw, -OMEGA_MAX_RADS), OMEGA_MAX_RADS);
+    }
 
     float half_B  = 0.5f * TRACK_WIDTH_M;
     float v_ref_L = fminf(fmaxf(v_base - half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
@@ -471,7 +679,6 @@ static void hil_control_step(
 
     *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref_L, vL_meas, m_total);
     *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref_R, vR_meas, m_total);
-    (void)crossbar_confirmed;
 #endif
 }
 
