@@ -6,8 +6,8 @@ clear; clc; close all;
 
 %% 1. Cấu hình
 BASE_URL = 'http://192.168.4.1:8080';
-MODE     = 'id30';   % 'check5' (5s kiểm tra phần cứng) hoặc 'id30' (30s nhận dạng)
-MOTOR    = 'AB';      % 'A', 'B', hoặc 'AB'
+MODE     = 'check5';   % 'check5' (5s kiểm tra phần cứng) hoặc 'id30' (30s nhận dạng)
+MOTOR    = 'A';      % 'A', 'B', hoặc 'AB'
 TS       = 0.005;    % Chu kỳ lấy mẫu cứng trên ESP32 (200 Hz)
 
 opts_json = weboptions('ContentType', 'json', 'Timeout', 10);

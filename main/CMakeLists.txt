@@ -4,9 +4,8 @@ idf_component_register(
         "../boot/ota.c"
         "../components/application/app.c"
         "../components/driver/wifi_ap.c"
-        "../components/driver/motor.c"
-        "../components/driver/encoder.c"
-        "../components/service/vel_ctrl.c"
+        "../components/driver/hx711.c"
+        "../components/service/loadcell_service.c"
 
     INCLUDE_DIRS
         "."
@@ -17,8 +16,6 @@ idf_component_register(
 
     REQUIRES
         esp_driver_gpio
-        esp_driver_ledc
-        esp_driver_gptimer
         esp_timer
         esp_wifi
         esp_netif
