@@ -35,5 +35,5 @@
 #define CAL_HTTP_PORT           8080
 
 /* Populated after running MATLAB calibration */
-#define HX711_CAL_TARE_COUNTS   0.0f
-#define HX711_CAL_COUNTS_PER_G  1.0f
+#define HX711_CAL_TARE_COUNTS   561595.012f
+#define HX711_CAL_COUNTS_PER_G  -388.694311f
