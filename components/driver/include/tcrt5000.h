@@ -40,6 +40,7 @@ void tcrt5000_set_emitters(bool enable);
  * @param[out] raw_values Array of size LINE_SENSOR_MAX_COUNT (7).
  */
 esp_err_t tcrt5000_read_raw(int raw_values[LINE_SENSOR_MAX_COUNT]);
+esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT]);
 
 #ifdef __cplusplus
 }

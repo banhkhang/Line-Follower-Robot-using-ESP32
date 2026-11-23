@@ -44,6 +44,21 @@ esp_err_t hx711_init(gpio_num_t dout_pin, gpio_num_t sck_pin)
     return ESP_OK;
 }
 
+void hx711_deinit(void)
+{
+    if (s_sck != GPIO_NUM_NC) {
+        /* Holding SCK HIGH > 60 us puts the HX711 into power-down mode (< 1 uA) */
+        gpio_set_level(s_sck, 1);
+        esp_rom_delay_us(80);
+        gpio_reset_pin(s_sck);
+        s_sck = GPIO_NUM_NC;
+    }
+    if (s_dout != GPIO_NUM_NC) {
+        gpio_reset_pin(s_dout);
+        s_dout = GPIO_NUM_NC;
+    }
+}
+
 bool hx711_is_ready(void)
 {
     return s_ready_to_use && gpio_get_level(s_dout) == 0;

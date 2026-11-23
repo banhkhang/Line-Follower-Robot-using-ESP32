@@ -107,19 +107,25 @@ void ota_boot_window(void)
     // =========================================================
     // 1. GPIO CONFIGURATION
     // =========================================================
-
+    gpio_reset_pin(PIN_BOOT_BUTTON);
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BOOT_BUTTON,
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
     };
+
+    gpio_reset_pin(PIN_USER_LED);
     gpio_config(&btn);
 
     gpio_config_t led = {
         .pin_bit_mask = 1ULL << PIN_USER_LED,
         .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&led);
+    gpio_set_level(PIN_USER_LED, 1);
 
     // =========================================================
     // 2. START WIFI ACCESS POINT
@@ -219,11 +225,11 @@ void ota_boot_window(void)
             break;
         }
 
-        // LED heartbeat: blink every 250 ms.
+        // LED heartbeat: blink every 1000 ms.
         uint32_t elapsed_ms =
             (uint32_t)elapsed_ticks * portTICK_PERIOD_MS;
 
-        gpio_set_level(PIN_USER_LED, (elapsed_ms / 250) % 2);
+        gpio_set_level(PIN_USER_LED, (elapsed_ms / 1000) % 2);
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }

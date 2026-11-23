@@ -154,3 +154,29 @@ esp_err_t tcrt5000_read_raw(int raw_values[LINE_SENSOR_MAX_COUNT])
 
     return overall_ret;
 }
+
+esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT])
+{
+    int val_on[LINE_SENSOR_MAX_COUNT]  = {0};
+    int val_off[LINE_SENSOR_MAX_COUNT] = {0};
+
+    /* 1. Read with IR LEDs ON (Total = Reflected IR + Ambient) */
+    tcrt5000_set_emitters(true);
+    esp_rom_delay_us(80); // Wait for TCRT5000 phototransistor + 100pF cap to settle
+    tcrt5000_read_raw(val_on);
+
+    /* 2. Read with IR LEDs OFF (Ambient room/sunlight only) */
+    tcrt5000_set_emitters(false);
+    esp_rom_delay_us(80);
+    tcrt5000_read_raw(val_off);
+
+    /* Leave emitters OFF between samples to save battery (~50 mA saved!) */
+    for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
+        /* Because phototransistor pulls A1..A7 LOW when illuminated:
+         * Bright white (high IR) -> val_on is LOW, val_off is HIGH -> (val_off - val_on) is LARGE
+         * Black line (low IR)    -> val_on ≈ val_off -> (val_off - val_on) is NEAR ZERO */
+        int diff = val_off[i] - val_on[i];
+        net_values[i] = (diff > 0) ? diff : 0;
+    }
+    return ESP_OK;
+}

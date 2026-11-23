@@ -5,7 +5,10 @@ idf_component_register(
         "../components/application/app.c"
 
         "../components/service/loadcell_service.c"
+        "../components/service/sensor_service.c"
+
         "../components/driver/hx711.c"
+        "../components/driver/tcrt5000.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
         # "../components/driver/motor.c"   # uncomment once motor.c is ready
@@ -24,6 +27,7 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_server
+        esp_adc
         nvs_flash
         app_update
     PRIV_REQUIRES esp_rom

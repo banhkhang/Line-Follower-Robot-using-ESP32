@@ -4,6 +4,7 @@
 #include "hx711.h"
 
 static int32_t s_offset = 0;
+static bool    s_enabled = false;
 
 /* Average LOADCELL_SAMPLES raw readings to calm down the noise. */
 static esp_err_t read_average(int32_t *average)
@@ -26,6 +27,20 @@ static esp_err_t read_average(int32_t *average)
 esp_err_t loadcell_service_init(void)
 {
     return hx711_init(PIN_HX711_DOUT, PIN_HX711_SCK);
+}
+
+void loadcell_service_deinit(void)
+{
+    if (!s_enabled) {
+        return;
+    }
+    hx711_deinit();
+    s_enabled = false;
+}
+
+bool loadcell_service_is_enabled(void)
+{
+    return s_enabled;
 }
 
 esp_err_t loadcell_service_tare(void)

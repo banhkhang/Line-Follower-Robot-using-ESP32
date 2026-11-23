@@ -18,6 +18,10 @@ typedef struct {
 /* Start the HX711 driver. */
 esp_err_t loadcell_service_init(void);
 
+void loadcell_service_deinit(void);
+
+bool loadcell_service_is_enabled(void);
+
 /* Measure the current (empty) load and remember it as zero. */
 esp_err_t loadcell_service_tare(void);
 
