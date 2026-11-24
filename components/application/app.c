@@ -8,7 +8,7 @@
 #include "wifi_ap.h"
 #include "telemetry.h"
 #include "loadcell_service.h"
-#include "line_sensor_service.h"
+#include "sensor_service.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,19 +21,32 @@ static void system_services_init(void)
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("esp_netif_lwip", ESP_LOG_WARN);
 
-    telemetry_init();
+    /* 1. Initialize NVS, esp_netif, and default event loop FIRST */
     wifi_ap_init_base();
+
+    /* 2. Now LwIP's tcpip mbox exists—safe to initialize UDP telemetry */
+    telemetry_init();
 
     ESP_LOGI(TAG, "System telemetry ready");
 
-    /* Opens SoftAP + HTTP upload page; keeps SoftAP alive if USE_TELEMETRY == 1 */
+    /* Stage 1: OTA Boot Window (press BOOT to skip) */
     ESP_LOGI(TAG, "Starting up");
     ota_boot_window();
 }
 
 static esp_err_t sensors_start(void)
 {
-    esp_err_t err = loadcell_service_init();
+    /* Stage 2: Line Sensor Init & Interactive Sweep Calibration */
+    esp_err_t err = sensor_service_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Running without line sensor service (%s)", esp_err_to_name(err));
+    }
+    else {
+        sensor_service_calibrate_sweep();
+    }
+
+    /* Stage 3: Load Cell (HX711) Init & Tare */
+    err = loadcell_service_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Load cell init failed (%s)", esp_err_to_name(err));
         return err;
@@ -57,57 +70,56 @@ static esp_err_t sensors_start(void)
 void app_start(void)
 {
     system_services_init();
+    sensors_start();
 
-    if (sensors_start() != ESP_OK) {
-        ESP_LOGW(TAG, "Running without load cell service");
-    }
+    uint8_t loadcell_div = 0;
 
     while (1) {
-        if (loadcell_service_is_enabled()) {
-            loadcell_reading_t r;
-            if (loadcell_service_read(&r) == ESP_OK) {
-                ESP_LOGI(TAG, "raw=%ld  net=%ld  grams=%.2f",
-                         (long)r.raw, (long)r.net, r.grams);
+        /* 1. Line Sensor Log (every 200 ms) */
+        if (sensor_service_is_enabled()) {
+            line_sensor_reading_t line;
+            if (sensor_service_read(&line) == ESP_OK) {
+                /* Build quick 6/7-char visual bar: '#' >= 50%, '+' >= 15%, '.' < 15% */
+                char bar[LINE_SENSOR_MAX_COUNT + 1] = {0};
+                for (int i = 0; i < line.active_count; i++) {
+                    if (line.norm[i] >= 50.0f)      bar[i] = '#';
+                    else if (line.norm[i] >= 15.0f) bar[i] = '+';
+                    else                            bar[i] = '.';
+                }
+#if USE_TELEMETRY
+                ESP_LOGI(TAG, "LINE [%s] | %3.0f %3.0f %3.0f %3.0f %3.0f %3.0f | err=%+6.2f mm | %s",
+                         bar,
+                         line.norm[0], line.norm[1], line.norm[2],
+                         line.norm[3], line.norm[4], line.norm[5],
+                         line.position_mm,
+                         line.line_detected ? "OK" : "LOST");
+#else
+                ESP_LOGI(TAG, "LINE [%s] | %3.0f %3.0f %3.0f %3.0f %3.0f %3.0f %3.0f | err=%+6.2f mm | %s",
+                         bar,
+                         line.norm[0], line.norm[1], line.norm[2],
+                         line.norm[3], line.norm[4], line.norm[5], line.norm[6],
+                         line.position_mm,
+                         line.line_detected ? "OK" : "LOST");
+#endif
             } else {
-                ESP_LOGW(TAG, "Load cell read failed");
+                ESP_LOGW(TAG, "Line sensor read failed");
             }
         }
 
-        /* Future: motor_service_update(), line_follower_step(), etc. */
+        /* 2. Load Cell Log (once every 10 sensor logs = every 2.0 s) */
+        if (++loadcell_div >= 10) {
+            loadcell_div = 0;
+            if (loadcell_service_is_enabled()) {
+                loadcell_reading_t r;
+                if (loadcell_service_read(&r) == ESP_OK) {
+                    ESP_LOGI(TAG, "WEIGHT     | raw=%8ld | net=%8ld | %7.2f g",
+                             (long)r.raw, (long)r.net, r.grams);
+                } else {
+                    ESP_LOGW(TAG, "Load cell read failed");
+                }
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-}
-    /* 3. Normal start-up: Khởi tạo và hiệu chỉnh dãy 7 cảm biến TCRT5000 */
-    if (line_sensor_service_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Line sensor init failed");
-        return;
-    }
-
-    /* Lặp lại quy trình hiệu chỉnh bằng tay cho đến khi cả 7 mắt đều đạt chuẩn */
-    while (line_sensor_service_calibrate_manual() != ESP_OK) {
-        ESP_LOGW(TAG, "Thu hieu chinh lai sau 2 giay...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-
-    /* Main loop: Đọc và in sai số phương ngang thô (chưa qua bộ lọc) */
-    while (1) {
-        line_sensor_reading_t sensor_data;
-
-        if (line_sensor_service_read(&sensor_data) == ESP_OK) {
-            if (sensor_data.line_detected) {
-                ESP_LOGI(TAG, "e_y_raw = %+6.2f mm | norm=[%.0f, %.0f, %.0f, %.0f, %.0f, %.0f, %.0f]",
-                         sensor_data.lateral_error_mm,
-                         sensor_data.norm[0], sensor_data.norm[1], sensor_data.norm[2],
-                         sensor_data.norm[3], sensor_data.norm[4], sensor_data.norm[5],
-                         sensor_data.norm[6]);
-            } else {
-                ESP_LOGW(TAG, "LOST LINE! last e_y_raw = %+6.2f mm", sensor_data.lateral_error_mm);
-            }
-        } else {
-            ESP_LOGE(TAG, "Line sensor read failed");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10)); /* Chu kỳ lấy mẫu 10ms (100Hz) */
     }
 }

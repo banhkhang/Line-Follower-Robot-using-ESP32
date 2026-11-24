@@ -6,14 +6,17 @@
 #include "telemetry.h"
 #include "config.h"
 #include "esp_log.h"
+#include "esp_event.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lwip/sockets.h"
 
 #define LINE_MAX_LEN   160      /* longer lines are cut */
-#define QUEUE_LINES    64       /* lines waiting to be sent */
+#define QUEUE_LINES    48       /* lines waiting to be sent */
+#define HISTORY_LINES   64      /* Keeps last 64 log lines (~10 KB) for replay on connect */
 #define PACKET_MAX     1000     /* bytes per UDP packet */
 
 typedef struct {
@@ -22,12 +25,31 @@ typedef struct {
 } line_t;
 
 static QueueHandle_t      s_queue = NULL;
+static SemaphoreHandle_t  s_hist_mutex = NULL;
 static int                s_sock  = -1;
 static struct sockaddr_in s_dest;
 static uint32_t           s_dropped = 0;
 static vprintf_like_t     s_uart_vprintf = NULL;
 
-/* ---------------- log -> queue ---------------- */
+/* Circular history buffer */
+static line_t   s_history[HISTORY_LINES];
+static uint32_t s_hist_head = 0;
+static uint32_t s_hist_count = 0;
+
+/* ---------------- History & queue ---------------- */
+
+static void record_history(const line_t *line)
+{
+    if (s_hist_mutex == NULL) return;
+    if (xSemaphoreTake(s_hist_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        s_history[s_hist_head] = *line;
+        s_hist_head = (s_hist_head + 1) % HISTORY_LINES;
+        if (s_hist_count < HISTORY_LINES) {
+            s_hist_count++;
+        }
+        xSemaphoreGive(s_hist_mutex);
+    }
+}
 
 static void enqueue(const char *text, int len)
 {
@@ -45,6 +67,8 @@ static void enqueue(const char *text, int len)
         line.text[len - 1] = '\n';
     }
     line.len = (uint16_t)len;
+
+    record_history(&line);
 
     if (xQueueSend(s_queue, &line, 0) != pdTRUE) {
         __atomic_fetch_add(&s_dropped, 1, __ATOMIC_RELAXED);
@@ -65,6 +89,26 @@ static int log_hook(const char *fmt, va_list args)
     }
     va_end(copy);
     return n;
+}
+/* Re-pushes buffered boot/OTA/calibration logs into the UDP queue when a PC connects */
+void telemetry_replay_history(void)
+{
+    if (s_queue == NULL || s_hist_mutex == NULL) return;
+
+    if (xSemaphoreTake(s_hist_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        uint32_t start = (s_hist_head + HISTORY_LINES - s_hist_count) % HISTORY_LINES;
+        for (uint32_t i = 0; i < s_hist_count; i++) {
+            uint32_t idx = (start + i) % HISTORY_LINES;
+            xQueueSend(s_queue, &s_history[idx], 0);
+        }
+        xSemaphoreGive(s_hist_mutex);
+    }
+}
+static void wifi_sta_connected_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    /* Give the PC ~400 ms to finish DHCP and bind its UDP socket, then replay boot logs */
+    vTaskDelay(pdMS_TO_TICKS(400));
+    telemetry_replay_history();
 }
 
 static bool pc_connected(void)
@@ -147,6 +191,10 @@ esp_err_t telemetry_init(void)
     if (s_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    /* Automatically replay history whenever a laptop connects to the SoftAP */
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                               &wifi_sta_connected_handler, NULL);
 
     if (xTaskCreate(sender_task, "telemetry", 4096, NULL, 1, NULL) != pdPASS) {
         vQueueDelete(s_queue);

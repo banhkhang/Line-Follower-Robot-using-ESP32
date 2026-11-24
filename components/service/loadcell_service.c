@@ -3,7 +3,7 @@
 #include "config.h"
 #include "hx711.h"
 
-static int32_t s_offset  = 0;
+static int32_t s_offset = 0;
 static bool    s_enabled = false;
 
 #define HX711_SAT_MAX    8388607     /* a reading at full scale is a glitch (or an overloaded cell) */
@@ -82,6 +82,20 @@ esp_err_t loadcell_service_init(void)
         s_enabled = true;
     }
     return err;
+}
+
+void loadcell_service_deinit(void)
+{
+    if (!s_enabled) {
+        return;
+    }
+    hx711_deinit();
+    s_enabled = false;
+}
+
+bool loadcell_service_is_enabled(void)
+{
+    return s_enabled;
 }
 
 void loadcell_service_deinit(void)

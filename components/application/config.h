@@ -37,6 +37,7 @@
 #define PIN_SENSOR_7     25   /* A7 - ADC2_CH8 (ADC2 cannot be used while Wi-Fi is on) */
 #define PIN_SENSOR_CTRL  26   /* schematic net "CTRL" - assumed sensor emitter enable, please verify */
 
+#define LINE_SENSOR_MAX_COUNT  7
 /* ------------------------------------------------------------------ */
 /* Motor driver (2 channels, 2 PWM inputs each) and encoders           */
 /* ------------------------------------------------------------------ */
