@@ -6,15 +6,15 @@
 #include "esp_err.h"
 #include "config.h"
 
+#define LINE_SENSOR_MAX_COUNT  7
+
+#if USE_TELEMETRY
+#define TCRT5000_ACTIVE_CHANNELS 5   /* Symmetric center window: S2, S3, S4, S5, S6 */
+#else
+#define TCRT5000_ACTIVE_CHANNELS 7   /* Full array: S1..S7 */
+#endif
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-/* Automatically exclude Sensor 7 (ADC2) when Wi-Fi telemetry stays active */
-#if USE_TELEMETRY
-    #define TCRT5000_ACTIVE_CHANNELS  6
-#else
-    #define TCRT5000_ACTIVE_CHANNELS  7
 #endif
 
 /**
@@ -40,8 +40,8 @@ void tcrt5000_set_emitters(bool enable);
  * @param[out] raw_values Array of size LINE_SENSOR_MAX_COUNT (7).
  */
 esp_err_t tcrt5000_read_raw(int raw_values[LINE_SENSOR_MAX_COUNT]);
-esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT]);
-
+esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT],
+                                    int amb_values[LINE_SENSOR_MAX_COUNT]);
 #ifdef __cplusplus
 }
 #endif

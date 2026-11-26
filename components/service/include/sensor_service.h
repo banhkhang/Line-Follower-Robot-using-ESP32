@@ -11,11 +11,19 @@ extern "C" {
 #endif
 
 typedef struct {
-    int   raw[LINE_SENSOR_MAX_COUNT];         /* Raw 12-bit ADC (0-4095) */
-    float norm[LINE_SENSOR_MAX_COUNT];        /* Normalized 0.0 (white) to 100.0 (black) */
-    float position_mm;                        /* Weighted average error e_line (mm) */
-    bool  line_detected;                      /* True if total normalized signal > threshold */
-    uint8_t active_count;                     /* 6 if USE_TELEMETRY == 1, else 7 */
+    int   min[LINE_SENSOR_MAX_COUNT];     /* Lowest ambient reading seen (brightest room light) */
+    int   max[LINE_SENSOR_MAX_COUNT];     /* Highest ambient reading seen (darkest shadow) */
+    float avg[LINE_SENSOR_MAX_COUNT];     /* Running average ambient ADC across samples */
+    int   current[LINE_SENSOR_MAX_COUNT]; /* Latest single-shot ambient reading (val_off) */
+} line_sensor_amb_t;
+
+typedef struct {
+    int               raw[LINE_SENSOR_MAX_COUNT];  /* Ambient-compensated net ADC (val_off - val_on) */
+    float             norm[LINE_SENSOR_MAX_COUNT]; /* Normalized 0.0 (white) to 100.0 (black) */
+    line_sensor_amb_t amb;                         /* Ambient light statistics (IR emitters OFF) */
+    float             position_mm;                 /* Weighted average error e_line (mm) */
+    bool              line_detected;               /* True if total normalized signal > threshold */
+    uint8_t           active_count;                /* TCRT5000_ACTIVE_CHANNELS (5 or 7) */
 } line_sensor_reading_t;
 
 esp_err_t sensor_service_init(void);

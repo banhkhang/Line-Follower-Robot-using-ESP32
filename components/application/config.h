@@ -18,9 +18,9 @@
 
 /*
  * Counts per gram. Leave at 1.0 until you calibrate (see README).
- * While it is 1.0 the "grams" printed on the serial monitor are just raw counts.
+ * While it is 1.0 the "grams" printed on the serbial monitor are just raw counts.
  */
-#define LOADCELL_SCALE   1.0f
+#define LOADCELL_SCALE   1000.0f
 
 /* ------------------------------------------------------------------ */
 /* Line sensor array (7x TCRT5000), analog inputs                      */
@@ -35,6 +35,11 @@
 #define PIN_SENSOR_CTRL  26   /* schematic net "CTRL" - assumed sensor emitter enable, please verify */
 
 #define LINE_SENSOR_MAX_COUNT  7
+
+/* 5 Sensors configuration variables */
+#define EDGE_CORR_START_MM   7.44f
+#define EDGE_CORR_GAIN       1.5132f
+
 /* ------------------------------------------------------------------ */
 /* Motor driver (2 channels, 2 PWM inputs each) and encoders           */
 /* ------------------------------------------------------------------ */
@@ -61,9 +66,15 @@
 #define OTA_WIFI_PASS     "12345678"   /* at least 8 characters */
 
 /* ---------------- Telemetry (wireless log) ---------------- */
-#define USE_TELEMETRY         1             /* 0 = no Wi-Fi at all while the robot runs */
+#define USE_TELEMETRY         0             /* 0 = no Wi-Fi at all while the robot runs */
 #define TELEMETRY_WIFI_SSID   "LineRobot-LOG"
 #define TELEMETRY_WIFI_PASS   "12345678"
 #define TELEMETRY_PORT        5000
 #define TELEMETRY_DEST_IP     "192.168.4.255"   /* broadcast: any PC on this Wi-Fi hears it */
 #define TELEMETRY_ALSO_UART   1                 /* 1 = also print on the USB cable (debugging) */
+
+#if USE_TELEMETRY
+#define TCRT5000_ACTIVE_CHANNELS 5   /* Symmetric center window: S2, S3, S4, S5, S6 */
+#else
+#define TCRT5000_ACTIVE_CHANNELS 7   /* Full array: S1..S7 */
+#endif

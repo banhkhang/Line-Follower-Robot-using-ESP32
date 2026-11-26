@@ -2,6 +2,7 @@
 #include "loadcell_service.h"
 #include "config.h"
 #include "hx711.h"
+#include "usr_led.h"
 
 static int32_t s_offset = 0;
 static bool    s_enabled = false;
@@ -26,9 +27,16 @@ static esp_err_t read_average(int32_t *average)
 
 esp_err_t loadcell_service_init(void)
 {
-    return hx711_init(PIN_HX711_DOUT, PIN_HX711_SCK);
-}
+    if (s_enabled) {
+        return ESP_OK;
+    }
 
+    esp_err_t err = hx711_init(PIN_HX711_DOUT, PIN_HX711_SCK);
+    if (err == ESP_OK) {
+        s_enabled = true;
+    }
+    return err;
+}
 void loadcell_service_deinit(void)
 {
     if (!s_enabled) {
@@ -45,6 +53,10 @@ bool loadcell_service_is_enabled(void)
 
 esp_err_t loadcell_service_tare(void)
 {
+    if (!s_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     int32_t zero;
     esp_err_t err = read_average(&zero);
     if (err == ESP_OK) {
@@ -55,6 +67,10 @@ esp_err_t loadcell_service_tare(void)
 
 esp_err_t loadcell_service_read(loadcell_reading_t *out)
 {
+    if (!s_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
     if (out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }

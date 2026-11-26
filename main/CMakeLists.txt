@@ -11,6 +11,7 @@ idf_component_register(
         "../components/driver/tcrt5000.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
+        "../components/driver/usr_led.c"
         # "../components/driver/motor.c"   # uncomment once motor.c is ready
         
     INCLUDE_DIRS
@@ -30,5 +31,6 @@ idf_component_register(
         esp_adc
         nvs_flash
         app_update
+        esp_timer
     PRIV_REQUIRES esp_rom
 )

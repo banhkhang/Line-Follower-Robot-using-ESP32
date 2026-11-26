@@ -1,8 +1,10 @@
+#include "config.h"
 #include "sensor_service.h"
 #include "tcrt5000.h"
+#include "usr_led.h"
+
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -13,32 +15,38 @@ static const char *TAG = "sensor_service";
 #define NORM_NOISE_DEADZONE     5.0f   /* Ignore <5% floor variation */
 #define LINE_DETECT_SUM_MIN     25.0f   /* Minimum sum(S_i) to consider line valid */
 #define SAMPLING_PERIOD_MS           10      /*(ms) per 1s: 1000ms/10ms = 100 Hz/*/
+
 static bool s_enabled = false;
 static int  s_r_white[LINE_SENSOR_MAX_COUNT];
 static int  s_r_black[LINE_SENSOR_MAX_COUNT];
 static float s_last_position_mm = 0.0f;
 
+/* Static ambient statistics accumulated across runtime reads */
+static int      s_amb_min[LINE_SENSOR_MAX_COUNT];
+static int      s_amb_max[LINE_SENSOR_MAX_COUNT];
+static uint64_t s_amb_sum[LINE_SENSOR_MAX_COUNT];
+static uint32_t s_amb_samples = 0;
+
 /* Symmetric sensor coordinates x_i in mm */
 #if USE_TELEMETRY
-/* 6 active sensors: center is S4 */
+/* 5 active sensors: S2, S3, S4, S5, S6 */
 static const float s_pos_mm[TCRT5000_ACTIVE_CHANNELS] = {
-    -3.0f * SENSOR_PITCH_MM,
-    -2.0f * SENSOR_PITCH_MM,
-    -1.0f * SENSOR_PITCH_MM,
-     0.0f,
-    +1.0f * SENSOR_PITCH_MM,
-    +2.0f * SENSOR_PITCH_MM,
+    -2.0f * SENSOR_PITCH_MM,   /* S2: -18.0 mm */
+    -1.0f * SENSOR_PITCH_MM,   /* S3:  -9.0 mm */
+     0.0f,                     /* S4:   0.0 mm */
+    +1.0f * SENSOR_PITCH_MM,   /* S5:  +9.0 mm */
+    +2.0f * SENSOR_PITCH_MM,   /* S6: +18.0 mm */
 };
 #else
 /* 7 active sensors: center is S4 */
 static const float s_pos_mm[TCRT5000_ACTIVE_CHANNELS] = {
-    -3.0f * SENSOR_PITCH_MM,
-    -2.0f * SENSOR_PITCH_MM,
-    -1.0f * SENSOR_PITCH_MM,
-     0.0f,
-    +1.0f * SENSOR_PITCH_MM,
-    +2.0f * SENSOR_PITCH_MM,
-    +3.0f * SENSOR_PITCH_MM
+    -3.0f * SENSOR_PITCH_MM,   /* S1: -27.0 mm */
+    -2.0f * SENSOR_PITCH_MM,   /* S2: -18.0 mm */
+    -1.0f * SENSOR_PITCH_MM,   /* S3:  -9.0 mm */
+     0.0f,                     /* S4:   0.0 mm */
+    +1.0f * SENSOR_PITCH_MM,   /* S5:  +9.0 mm */
+    +2.0f * SENSOR_PITCH_MM,   /* S6: +18.0 mm */
+    +3.0f * SENSOR_PITCH_MM,   /* S7: +27.0 mm */
 };
 #endif
 
@@ -94,6 +102,16 @@ bool sensor_service_is_enabled(void)
     return s_enabled;
 }
 
+static void reset_amb_stats(void)
+{
+    for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
+        s_amb_min[i] = 4095;
+        s_amb_max[i] = 0;
+        s_amb_sum[i] = 0;
+    }
+    s_amb_samples = 0;
+}
+
 esp_err_t sensor_service_calibrate_sweep(void)
 {
     if (!s_enabled) {
@@ -132,9 +150,26 @@ esp_err_t sensor_service_calibrate_sweep(void)
 
     ESP_LOGI(TAG, "SWEEPING... Wave sensors across white & black line. Press BOOT to FINISH.");
 
-    uint32_t blink_ms = 0;
+    // while (gpio_get_level(PIN_BOOT_BUTTON) != 0) {
+    //     if (tcrt5000_read_raw(sample) == ESP_OK) {
+    //         for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
+    //             if (sample[i] >= 0) {
+    //                 if (sample[i] < min_val[i]) min_val[i] = sample[i];
+    //                 if (sample[i] > max_val[i]) max_val[i] = sample[i];
+    //             }
+    //         }
+    //     }
+
+    //     /* Fast 100 ms blink on USER_LED to indicate active sweeping */
+    //     usr_led_blink_poll(100);     /* Fast 100 ms blink while sweeping */
+
+    //     vTaskDelay(pdMS_TO_TICKS(SAMPLING_PERIOD_MS));
+    // }
+
+    /* implementing tcrt5000_read_compensated*/
+    int amb_sample[LINE_SENSOR_MAX_COUNT];
     while (gpio_get_level(PIN_BOOT_BUTTON) != 0) {
-        if (tcrt5000_read_raw(sample) == ESP_OK) {
+        if (tcrt5000_read_compensated(sample, amb_sample) == ESP_OK) {
             for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
                 if (sample[i] >= 0) {
                     if (sample[i] < min_val[i]) min_val[i] = sample[i];
@@ -142,77 +177,161 @@ esp_err_t sensor_service_calibrate_sweep(void)
                 }
             }
         }
-
-        /* Fast 100 ms blink on USER_LED to indicate active sweeping */
-        blink_ms += SAMPLING_PERIOD_MS;
-        gpio_set_level(PIN_USER_LED, (blink_ms / 100) % 2);
-
+        usr_led_blink_poll(100);
         vTaskDelay(pdMS_TO_TICKS(SAMPLING_PERIOD_MS));
     }
+
         /* Wait for button release after stopping sweep */
     while (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    gpio_set_level(PIN_USER_LED, 0);
+    usr_led_set(false);
 
     /* STAGE 3: Commit calibration values with a 10% guard margin */
-    ESP_LOGI(TAG, "CALIBRATION COMPLETE:");
+    // ESP_LOGI(TAG, "CALIBRATION COMPLETE:");
+    // for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
+    //     int span = max_val[i] - min_val[i];
+    //     if (span < 200) {
+    //         ESP_LOGW(TAG, "  S%d low contrast (min=%d, max=%d) - check sweep!",
+    //                  i + 1, min_val[i], max_val[i]);
+    //         s_r_white[i] = min_val[i];
+    //         s_r_black[i] = max_val[i];
+    //     } else {
+    //         /* 10% inward margin absorbs minor floor/tape sheen variations */
+    //         int margin = span / 10;
+    //         s_r_white[i] = min_val[i] + margin;
+    //         s_r_black[i] = max_val[i] - margin;
+    //     }
+    //     ESP_LOGI(TAG, "  S%d -> R_white=%4d, R_black=%4d (span=%4d)",
+    //              i + 1, s_r_white[i], s_r_black[i], s_r_black[i] - s_r_white[i]);
+    // }
+
+    /* inverting black and white due to the use of read_compensated*/
+    ESP_LOGI(TAG, "CALIBRATION COMPLETE (Ambient-Compensated):");
     for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
         int span = max_val[i] - min_val[i];
         if (span < 200) {
-            ESP_LOGW(TAG, "  S%d low contrast (min=%d, max=%d) - check sweep!",
+            ESP_LOGW(TAG, "  Ch%d low contrast (black=%d, white=%d) - check sweep!",
                      i + 1, min_val[i], max_val[i]);
-            s_r_white[i] = min_val[i];
-            s_r_black[i] = max_val[i];
+            s_r_black[i] = min_val[i];
+            s_r_white[i] = max_val[i];
         } else {
-            /* 10% inward margin absorbs minor floor/tape sheen variations */
             int margin = span / 10;
-            s_r_white[i] = min_val[i] + margin;
-            s_r_black[i] = max_val[i] - margin;
+            s_r_black[i] = min_val[i] + margin;
+            s_r_white[i] = max_val[i] - margin;
         }
-        ESP_LOGI(TAG, "  S%d -> R_white=%4d, R_black=%4d (span=%4d)",
-                 i + 1, s_r_white[i], s_r_black[i], s_r_black[i] - s_r_white[i]);
+        ESP_LOGI(TAG, "  Ch%d -> R_white=%4d, R_black=%4d (span=%4d)",
+                 i + 1, s_r_white[i], s_r_black[i], s_r_white[i] - s_r_black[i]);
     }
 
+    reset_amb_stats(); /* Start fresh ambient tracking for main runtime */
     return ESP_OK;
 }
+
+
+// esp_err_t sensor_service_read(line_sensor_reading_t *out_reading)
+// {
+//     if (!s_enabled) return ESP_ERR_INVALID_STATE;
+//     if (out_reading == NULL) return ESP_ERR_INVALID_ARG;
+    
+//     esp_err_t err = tcrt5000_read_raw(out_reading->raw);
+//     if (err != ESP_OK) {
+//         return err;
+//     }
+    
+//     /* WEIGHTED AVERAGE METHOD IMPLEMENTATION*/
+//     out_reading->active_count = TCRT5000_ACTIVE_CHANNELS;
+//     float weighted_sum = 0.0f;
+//     float total_weight = 0.0f;
+
+//     for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
+//         if (i >= TCRT5000_ACTIVE_CHANNELS || out_reading->raw[i] < 0) {
+//             out_reading->norm[i] = 0.0f;
+//             continue;
+//         }
+
+//         int denom = s_r_black[i] - s_r_white[i];
+//         float s_i = 0.0f;
+
+//         if (denom > 0) {
+//             s_i = ((float)(out_reading->raw[i] - s_r_white[i]) / (float)denom) * 100.0f;
+//         }
+
+//         /* Clamp to [0.0, 100.0] */
+//         if (s_i < 0.0f) s_i = 0.0f;
+//         if (s_i > 100.0f) s_i = 100.0f;
+
+//         /* Apply floor noise deadzone */
+//         if (s_i < NORM_NOISE_DEADZONE) {
+//             s_i = 0.0f;
+//         }
+
+//         out_reading->norm[i] = s_i;
+//         weighted_sum += s_i * s_pos_mm[i];
+//         total_weight += s_i;
+//     }
+
+//     if (total_weight >= LINE_DETECT_SUM_MIN) {
+//         out_reading->line_detected = true;
+//         out_reading->position_mm = weighted_sum / total_weight;
+//         s_last_position_mm = out_reading->position_mm;
+//     } else {
+//         /* Line lost: hold last known side so PID knows which way to turn back */
+//         out_reading->line_detected = false;
+//         out_reading->position_mm = s_last_position_mm;
+//     }
+
+//     return ESP_OK;
+// }
 
 esp_err_t sensor_service_read(line_sensor_reading_t *out_reading)
 {
     if (!s_enabled) return ESP_ERR_INVALID_STATE;
     if (out_reading == NULL) return ESP_ERR_INVALID_ARG;
-    
-    esp_err_t err = tcrt5000_read_raw(out_reading->raw);
+
+    int amb_raw[LINE_SENSOR_MAX_COUNT];
+    esp_err_t err = tcrt5000_read_compensated(out_reading->raw, amb_raw);
     if (err != ESP_OK) {
         return err;
     }
-    
-    /* WEIGHTED AVERAGE METHOD IMPLEMENTATION*/
+
+    s_amb_samples++;
     out_reading->active_count = TCRT5000_ACTIVE_CHANNELS;
     float weighted_sum = 0.0f;
     float total_weight = 0.0f;
 
     for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
         if (i >= TCRT5000_ACTIVE_CHANNELS || out_reading->raw[i] < 0) {
-            out_reading->norm[i] = 0.0f;
+            out_reading->norm[i]        = 0.0f;
+            out_reading->amb.current[i] = -1;
+            out_reading->amb.min[i]     = -1;
+            out_reading->amb.max[i]     = -1;
+            out_reading->amb.avg[i]     = 0.0f;
             continue;
         }
 
-        int denom = s_r_black[i] - s_r_white[i];
+        /* Update ambient min / max / running average */
+        int a = amb_raw[i];
+        if (a < s_amb_min[i]) s_amb_min[i] = a;
+        if (a > s_amb_max[i]) s_amb_max[i] = a;
+        s_amb_sum[i] += (uint64_t)a;
+
+        out_reading->amb.current[i] = a;
+        out_reading->amb.min[i]     = s_amb_min[i];
+        out_reading->amb.max[i]     = s_amb_max[i];
+        out_reading->amb.avg[i]     = (float)s_amb_sum[i] / (float)s_amb_samples;
+
+        /* Normalize: R_white -> 0.0%, R_black -> 100.0% */
+        int denom = s_r_white[i] - s_r_black[i];
         float s_i = 0.0f;
 
         if (denom > 0) {
-            s_i = ((float)(out_reading->raw[i] - s_r_white[i]) / (float)denom) * 100.0f;
+            s_i = ((float)(s_r_white[i] - out_reading->raw[i]) / (float)denom) * 100.0f;
         }
 
-        /* Clamp to [0.0, 100.0] */
         if (s_i < 0.0f) s_i = 0.0f;
         if (s_i > 100.0f) s_i = 100.0f;
-
-        /* Apply floor noise deadzone */
-        if (s_i < NORM_NOISE_DEADZONE) {
-            s_i = 0.0f;
-        }
+        if (s_i < NORM_NOISE_DEADZONE) s_i = 0.0f;
 
         out_reading->norm[i] = s_i;
         weighted_sum += s_i * s_pos_mm[i];
@@ -221,10 +340,20 @@ esp_err_t sensor_service_read(line_sensor_reading_t *out_reading)
 
     if (total_weight >= LINE_DETECT_SUM_MIN) {
         out_reading->line_detected = true;
-        out_reading->position_mm = weighted_sum / total_weight;
+
+        float pos = weighted_sum / total_weight;
+#if USE_TELEMETRY
+        /* Compensate 5-sensor edge compression beyond divergence threshold */
+        float abs_pos = (pos >= 0.0f) ? pos : -pos;
+        if (abs_pos > EDGE_CORR_START_MM) {
+            float corr = EDGE_CORR_START_MM + (abs_pos - EDGE_CORR_START_MM) * EDGE_CORR_GAIN;
+            pos = (pos >= 0.0f) ? corr : -corr;
+        }
+#endif
+
+        out_reading->position_mm = -weighted_sum / total_weight;
         s_last_position_mm = out_reading->position_mm;
     } else {
-        /* Line lost: hold last known side so PID knows which way to turn back */
         out_reading->line_detected = false;
         out_reading->position_mm = s_last_position_mm;
     }

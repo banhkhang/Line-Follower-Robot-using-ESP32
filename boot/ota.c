@@ -3,6 +3,8 @@
 #include "ota.h"
 #include "wifi_ap.h"
 #include "config.h"
+#include "usr_led.h"
+
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_event.h"
@@ -114,18 +116,7 @@ void ota_boot_window(void)
         .pull_up_en   = GPIO_PULLUP_ENABLE,
     };
 
-    gpio_reset_pin(PIN_USER_LED);
     gpio_config(&btn);
-
-    gpio_config_t led = {
-        .pin_bit_mask = 1ULL << PIN_USER_LED,
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&led);
-    gpio_set_level(PIN_USER_LED, 1);
 
     // =========================================================
     // 2. START WIFI ACCESS POINT
@@ -226,10 +217,7 @@ void ota_boot_window(void)
         }
 
         // LED heartbeat: blink every 1000 ms.
-        uint32_t elapsed_ms =
-            (uint32_t)elapsed_ticks * portTICK_PERIOD_MS;
-
-        gpio_set_level(PIN_USER_LED, (elapsed_ms / 1000) % 2);
+        usr_led_blink_poll(1000);
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
