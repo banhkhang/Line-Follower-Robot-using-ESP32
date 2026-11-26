@@ -15,7 +15,9 @@ idf_component_register(
         "../components/driver/encoder.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
-
+        "../components/driver/usr_led.c"
+        # "../components/driver/motor.c"   # uncomment once motor.c is ready
+        
     INCLUDE_DIRS
         "."
         "../boot"
@@ -36,5 +38,6 @@ idf_component_register(
         esp_adc
         nvs_flash
         app_update
+        esp_timer
     PRIV_REQUIRES esp_rom
 )

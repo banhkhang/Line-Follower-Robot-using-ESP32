@@ -11,20 +11,37 @@ static adc_oneshot_unit_handle_t s_adc2_handle = NULL;
 #endif
 
 typedef struct {
-    adc_unit_t unit;
+    adc_unit_t    unit;
     adc_channel_t channel;
-    int gpio_num;
+    int           gpio_num;
+    int           sensor_num; /* Physical PCB silkscreen number (1..7) */
 } tcrt_channel_map_t;
 
+/*
+ * TESTING CONFIGURATION NOTE:
+ * - When USE_TELEMETRY == 1 (Wi-Fi active for UDP logging/tuning):
+ *   ADC2 cannot be used alongside Wi-Fi, disabling S7 (GPIO 25).
+ *   We intentionally exclude S1 (GPIO 36) as well so the active 5-sensor
+ *   window (S2..S6) remains symmetric around center sensor S4 (0 mm).
+ * - When USE_TELEMETRY == 0 (Competition mode, Wi-Fi off):
+ *   All 7 sensors (S1..S7) operate across the full -27 mm to +27 mm span.
+ */
+
 static const tcrt_channel_map_t s_sensor_map[TCRT5000_ACTIVE_CHANNELS] = {
-    { ADC_UNIT_1, ADC_CHANNEL_0, PIN_SENSOR_1 }, // S1: GPIO 36
-    { ADC_UNIT_1, ADC_CHANNEL_3, PIN_SENSOR_2 }, // S2: GPIO 39
-    { ADC_UNIT_1, ADC_CHANNEL_6, PIN_SENSOR_3 }, // S3: GPIO 34
-    { ADC_UNIT_1, ADC_CHANNEL_7, PIN_SENSOR_4 }, // S4: GPIO 35
-    { ADC_UNIT_1, ADC_CHANNEL_4, PIN_SENSOR_5 }, // S5: GPIO 32
-    { ADC_UNIT_1, ADC_CHANNEL_5, PIN_SENSOR_6 }, // S6: GPIO 33
-#if !USE_TELEMETRY
-    { ADC_UNIT_2, ADC_CHANNEL_8, PIN_SENSOR_7 }, // S7: GPIO 25 (Only compiled when Wi-Fi is off)
+#if USE_TELEMETRY
+    { ADC_UNIT_1, ADC_CHANNEL_3, PIN_SENSOR_2, 2 }, // Index 0 -> S2: GPIO 39 (-18 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_6, PIN_SENSOR_3, 3 }, // Index 1 -> S3: GPIO 34 ( -9 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_7, PIN_SENSOR_4, 4 }, // Index 2 -> S4: GPIO 35 (  0 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_4, PIN_SENSOR_5, 5 }, // Index 3 -> S5: GPIO 32 ( +9 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_5, PIN_SENSOR_6, 6 }, // Index 4 -> S6: GPIO 33 (+18 mm)
+#else
+    { ADC_UNIT_1, ADC_CHANNEL_0, PIN_SENSOR_1, 1 }, // Index 0 -> S1: GPIO 36 (-27 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_3, PIN_SENSOR_2, 2 }, // Index 1 -> S2: GPIO 39 (-18 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_6, PIN_SENSOR_3, 3 }, // Index 2 -> S3: GPIO 34 ( -9 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_7, PIN_SENSOR_4, 4 }, // Index 3 -> S4: GPIO 35 (  0 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_4, PIN_SENSOR_5, 5 }, // Index 4 -> S5: GPIO 32 ( +9 mm)
+    { ADC_UNIT_1, ADC_CHANNEL_5, PIN_SENSOR_6, 6 }, // Index 5 -> S6: GPIO 33 (+18 mm)
+    { ADC_UNIT_2, ADC_CHANNEL_8, PIN_SENSOR_7, 7 }, // Index 6 -> S7: GPIO 25 (+27 mm)
 #endif
 };
 
@@ -77,7 +94,7 @@ esp_err_t tcrt5000_init(void)
         return ret;
     }
 #else
-    ESP_LOGW(TAG, "USE_TELEMETRY=1: Sensor 7 (GPIO %d / ADC2) disabled to prevent Wi-Fi conflict", PIN_SENSOR_7);
+    ESP_LOGW(TAG, "USE_TELEMETRY=1: Sensor 1&7 (GPIO %d & %d / ADC2) disabled to prevent Wi-Fi conflict",PIN_SENSOR_1, PIN_SENSOR_7);
 #endif
 
     /* 4. Configure active channels */
@@ -155,28 +172,50 @@ esp_err_t tcrt5000_read_raw(int raw_values[LINE_SENSOR_MAX_COUNT])
     return overall_ret;
 }
 
-esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT])
+esp_err_t tcrt5000_read_compensated(int net_values[LINE_SENSOR_MAX_COUNT],
+                                    int amb_values[LINE_SENSOR_MAX_COUNT])
 {
+    if (net_values == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     int val_on[LINE_SENSOR_MAX_COUNT]  = {0};
     int val_off[LINE_SENSOR_MAX_COUNT] = {0};
 
     /* 1. Read with IR LEDs ON (Total = Reflected IR + Ambient) */
     tcrt5000_set_emitters(true);
     esp_rom_delay_us(80); // Wait for TCRT5000 phototransistor + 100pF cap to settle
-    tcrt5000_read_raw(val_on);
+    esp_err_t err1 = tcrt5000_read_raw(val_on);
 
     /* 2. Read with IR LEDs OFF (Ambient room/sunlight only) */
     tcrt5000_set_emitters(false);
     esp_rom_delay_us(80);
-    tcrt5000_read_raw(val_off);
+    esp_err_t err2 = tcrt5000_read_raw(val_off);
+
+    if (err1 != ESP_OK || err2 != ESP_OK) {
+        return (err1 != ESP_OK) ? err1 : err2;
+    }
 
     /* Leave emitters OFF between samples to save battery (~50 mA saved!) */
     for (int i = 0; i < TCRT5000_ACTIVE_CHANNELS; i++) {
+        if (i >= TCRT5000_ACTIVE_CHANNELS || val_on[i] < 0 || val_off[i] < 0) {
+            net_values[i] = -1;
+            if (amb_values != NULL) amb_values[i] = -1;
+            continue;
+        }
+
         /* Because phototransistor pulls A1..A7 LOW when illuminated:
          * Bright white (high IR) -> val_on is LOW, val_off is HIGH -> (val_off - val_on) is LARGE
-         * Black line (low IR)    -> val_on ≈ val_off -> (val_off - val_on) is NEAR ZERO */
+         * Black line (low IR)    -> val_on ≈ val_off -> (val_off - val_on) is NEAR ZERO 
+         * val_on = ambience + raw_data 
+         * val_off = ambience*/
+
         int diff = val_off[i] - val_on[i];
         net_values[i] = (diff > 0) ? diff : 0;
+
+        if (amb_values != NULL) {
+            amb_values[i] = val_off[i];
+        }   
     }
     return ESP_OK;
 }

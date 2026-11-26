@@ -41,6 +41,11 @@
 #define PIN_SENSOR_CTRL  26   /* schematic net "CTRL" - assumed sensor emitter enable, please verify */
 
 #define LINE_SENSOR_MAX_COUNT  7
+
+/* 5 Sensors configuration variables */
+#define EDGE_CORR_START_MM   7.44f
+#define EDGE_CORR_GAIN       1.5132f
+
 /* ------------------------------------------------------------------ */
 /* Motor driver (DRV8871 + 6N137 optocouplers) & Hall encoders        */
 /* ------------------------------------------------------------------ */
@@ -82,4 +87,10 @@
 #define TELEMETRY_WIFI_PASS   "12345678"
 #define TELEMETRY_PORT        5000
 #define TELEMETRY_DEST_IP     "192.168.4.255"   /* broadcast: any PC on this Wi-Fi hears it */
-#define TELEMETRY_ALSO_UART   0                 /* 1 = also print on the USB cable (debugging) */
+#define TELEMETRY_ALSO_UART   1                 /* 1 = also print on the USB cable (debugging) */
+
+#if USE_TELEMETRY
+#define TCRT5000_ACTIVE_CHANNELS 5   /* Symmetric center window: S2, S3, S4, S5, S6 */
+#else
+#define TCRT5000_ACTIVE_CHANNELS 7   /* Full array: S1..S7 */
+#endif
