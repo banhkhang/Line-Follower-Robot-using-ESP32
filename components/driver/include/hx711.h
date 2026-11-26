@@ -15,7 +15,7 @@
 
 /* Set up the two pins. Call once at start-up. */
 esp_err_t hx711_init(gpio_num_t dout_pin, gpio_num_t sck_pin);
-
+void hx711_deinit(void);
 /* true when a new sample is waiting (DOUT is LOW). */
 bool hx711_is_ready(void);
 

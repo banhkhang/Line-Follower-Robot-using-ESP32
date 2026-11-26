@@ -7,13 +7,17 @@ idf_component_register(
         "../components/service/loadcell_service.c"
         "../components/service/vel_ctrl.c"
         "../components/service/drive_service.c"
+        "../components/service/sensor_service.c"
 
         "../components/driver/hx711.c"
+        "../components/driver/tcrt5000.c"
         "../components/driver/motor.c"
         "../components/driver/encoder.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
-
+        "../components/driver/usr_led.c"
+        # "../components/driver/motor.c"   # uncomment once motor.c is ready
+        
     INCLUDE_DIRS
         "."
         "../boot"
@@ -31,7 +35,9 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_server
+        esp_adc
         nvs_flash
         app_update
+        esp_timer
     PRIV_REQUIRES esp_rom
 )
