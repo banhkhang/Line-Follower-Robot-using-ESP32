@@ -7,7 +7,7 @@ clear; clc; close all;
 %% 1. Cấu hình chạy thử
 BASE_URL = 'http://192.168.4.1:8080';
 MOTOR    = 'AB';         % 'A', 'B', hoặc 'AB' (chạy đồng thời 2 bánh)
-PRESET   = 'floor_13kg';      % 'bench' (trên gá đỡ) hoặc 'floor_13kg' (sàn thật 1.3 kg)
+PRESET   = 'floor_2kg';      % 'bench' (trên gá đỡ) hoặc 'floor_13kg' (sàn thật 1.3 kg)
 TS       = 0.005;
 
 % Tiêu chuẩn nghiệm thu
@@ -17,13 +17,20 @@ OS_LIMIT_P = 5.0;        % OS% < 5%
 opts_json = weboptions('ContentType', 'json', 'Timeout', 10);
 opts_bin  = weboptions('ContentType', 'binary', 'Timeout', 20);
 
-%% 2. Gửi tham số 2-DOF PI nóng qua /tune
-if strcmp(PRESET, 'floor_13kg')
-    pA = struct('kp', 310.0, 'ki', 2200.0, 'kff', 86.90, 'udz', 4.85, 'eband', 0.020);
-    pB = struct('kp', 355.0, 'ki', 2100.0, 'kff', 81.80, 'udz', 5.45, 'eband', 0.020);
-else
-    pA = struct('kp', 227.0, 'ki', 2978.0, 'kff', 85.72, 'udz', 2.62, 'eband', 0.030);
-    pB = struct('kp', 272.0, 'ki', 2856.0, 'kff', 82.22, 'udz', 1.66, 'eband', 0.030);
+%% 2. Gửi tham số 2-DOF PI nóng qua /tune (đã hiệu chuẩn đủ 3 mức tải 0 / 1 / 2 kg)
+switch PRESET
+    case 'floor_2kg'      % Xe 1.3 kg + tải 2 kg (M_total = 3.3 kg)
+        pA = struct('kp', 518.0, 'ki', 2193.0, 'kff', 86.0, 'udz', 10.0, 'eband', 0.030);
+        pB = struct('kp', 599.0, 'ki', 2091.0, 'kff', 82.0, 'udz', 14.5, 'eband', 0.030);
+    case 'floor_1kg'      % Xe 1.3 kg + tải 1 kg (M_total = 2.3 kg)
+        pA = struct('kp', 418.0, 'ki', 2193.0, 'kff', 86.0, 'udz',  7.3, 'eband', 0.025);
+        pB = struct('kp', 505.0, 'ki', 2091.0, 'kff', 82.0, 'udz', 10.0, 'eband', 0.025);
+    case 'floor_13kg'     % Xe 1.3 kg không tải
+        pA = struct('kp', 319.0, 'ki', 2193.0, 'kff', 86.0, 'udz',  4.6, 'eband', 0.020);
+        pB = struct('kp', 410.0, 'ki', 2091.0, 'kff', 82.0, 'udz',  6.5, 'eband', 0.020);
+    otherwise             % 'bench' (gá đỡ)
+        pA = struct('kp', 227.0, 'ki', 2978.0, 'kff', 85.72, 'udz', 2.62, 'eband', 0.030);
+        pB = struct('kp', 272.0, 'ki', 2856.0, 'kff', 82.22, 'udz', 1.66, 'eband', 0.030);
 end
 
 fprintf('Nạp tham số preset [%s]...\n', PRESET);
@@ -96,10 +103,10 @@ for c = 1:numel(channels)
     v_meas  = channels{c}{2};
     u_pwm   = channels{c}{3};
 
-    fprintf('\n==================== NGHIỆM THU %s (%s) ====================\n', ch_name, PRESET);
-    fprintf('%-15s | %-9s | %-8s | %-11s | %-9s | %s\n', ...
-            'Bước nhảy', 'Ts,5% (s)', 'OS% (%)', 'ess (mm/s)', 'PWMmax(%)', 'Kết quả');
-    fprintf('%s\n', repmat('-', 1, 74));
+    fprintf('\n======================== NGHIỆM THU %s (%s) ========================\n', ch_name, PRESET);
+    fprintf('%-15s | %-10s | %-9s | %-8s | %-11s | %-9s | %s\n', ...
+            'Bước nhảy', 'Ts_init(s)', 'Ts,5% (s)', 'OS% (%)', 'ess (mm/s)', 'PWMmax(%)', 'Kết quả');
+    fprintf('%s\n', repmat('-', 1, 87));
 
     for k = 1:size(steps, 1)
         s_name = steps{k,1};
@@ -122,7 +129,15 @@ for c = 1:numel(channels)
             Ts5 = ts(outside(end) + 1);
         end
 
-        
+        % Tính thêm Ts5_init (vào dải ±5% và ổn định tối thiểu 10 mẫu = 50 ms)
+        inside = abs(ym - v1) <= band;
+        Ts5_init = NaN;
+        for idx_i = 1:(numel(inside) - 9)
+            if all(inside(idx_i:idx_i+9))
+                Ts5_init = ts(idx_i);
+                break;
+            end
+        end
 
         if dv > 0
             os_pct = max(0, (max(ym) - v1) / abs(dv) * 100);
@@ -136,8 +151,8 @@ for c = 1:numel(channels)
         pass = (~isnan(Ts5)) && (Ts5 <= TS_LIMIT_S) && (os_pct < OS_LIMIT_P);
         verdict = 'ĐẠT'; if ~pass, verdict = 'CHƯA ĐẠT'; end
 
-        fprintf('%-15s | %9.4f | %8.2f | %+11.2f | %9.1f | %s\n', ...
-                s_name, Ts5, os_pct, ess_mm, pwm_max, verdict);
+        fprintf('%-15s | %10.4f | %9.4f | %8.2f | %+11.2f | %9.1f | %s\n', ...
+                s_name, Ts5_init, Ts5, os_pct, ess_mm, pwm_max, verdict);
     end
 end
 

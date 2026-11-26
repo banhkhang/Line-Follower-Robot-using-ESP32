@@ -74,3 +74,26 @@ float vel_ctrl_step(vel_ctrl_t *c, float v_ref, float v_meas, float dt_s)
     c->in_band  = within_band;
     return u_out;
 }
+
+void vel_ctrl_apply_payload(vel_ctrl_t *ctrl_a, vel_ctrl_t *ctrl_b, float m_load_kg)
+{
+    if (m_load_kg < 0.0f) m_load_kg = 0.0f;
+    if (m_load_kg > 2.5f) m_load_kg = 2.5f;
+
+    float eband = 0.020f + 0.005f * m_load_kg;
+
+    /* Hiệu chuẩn 3 điểm 0/1/2 kg trên bạt sa bàn (w_gc = 30 rad/s, PM ~ 74 deg) */
+    ctrl_a->p.kp     = 291.0f + 67.6f * m_load_kg;
+    ctrl_a->p.ki     = 2064.0f;
+    ctrl_a->p.kff    = 86.0f;
+    ctrl_a->p.u_dz   = 4.51f  + 2.78f * m_load_kg;
+    ctrl_a->p.e_band = eband;
+    ctrl_a->p.u_max  = 100.0f;
+
+    ctrl_b->p.kp     = 326.7f + 79.7f * m_load_kg;
+    ctrl_b->p.ki     = 1968.0f;
+    ctrl_b->p.kff    = 82.0f;
+    ctrl_b->p.u_dz   = 7.32f  + 5.21f * m_load_kg;
+    ctrl_b->p.e_band = eband;
+    ctrl_b->p.u_max  = 100.0f;
+}

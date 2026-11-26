@@ -150,5 +150,13 @@ float encoder_sample_rpm(enc_ch_t ch, int64_t now_us, int16_t *out_delta)
         e->last_rpm = rpm;
     }
 
+    /* Chống gai mất 1 xung đơn lẻ (nhảy > 30 RPM ~ 102 mm/s trong 5 ms là bất khả thi vật lý) */
+    if (e->last_rpm != 0.0f && fabsf(rpm - e->last_rpm) > 30.0f) {
+        /* Giữ giá trị trước đúng 1 nhịp (nếu nhịp sau vẫn khác thì chấp nhận thật) */
+        rpm = e->last_rpm;
+        e->last_rpm = 0.0f;
+        return rpm;
+    }
+    e->last_rpm = rpm;
     return rpm;
 }
