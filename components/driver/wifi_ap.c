@@ -63,7 +63,7 @@ esp_err_t wifi_ap_on(const char *ssid, const char *pass)
         return err;
     }
 
-    /* Bắt buộc tắt power-save để giữ jitter thấp cho HIL 200 Hz */
+    /* Disable Wi-Fi power-save to keep UDP latency and jitter low */
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     s_radio_on = true;
@@ -78,4 +78,19 @@ void wifi_ap_off(void)
     esp_wifi_stop();
     esp_wifi_deinit();
     s_radio_on = false;
+}
+
+bool wifi_ap_is_on(void)
+{
+    return s_radio_on;
+}
+
+bool wifi_ap_has_station(void)
+{
+    if (!s_radio_on) {
+        return false;
+    }
+    wifi_sta_list_t list;
+    memset(&list, 0, sizeof(list));
+    return (esp_wifi_ap_get_sta_list(&list) == ESP_OK && list.num > 0);
 }

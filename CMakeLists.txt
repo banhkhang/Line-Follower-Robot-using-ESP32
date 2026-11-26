@@ -3,8 +3,4 @@
 cmake_minimum_required(VERSION 3.22)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-<<<<<<< HEAD
-project(esp32s3_hil_robot)
-=======
 project(line_follower_robot)
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51

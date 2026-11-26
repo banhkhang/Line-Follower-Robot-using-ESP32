@@ -18,9 +18,9 @@ static volatile bool s_busy = false;
 
 static const char PAGE[] =
 "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>ESP32-S3 HIL Update</title></head>"
+"<title>LineRobot ESP32 OTA</title></head>"
 "<body style='font-family:sans-serif;max-width:420px;margin:2em auto'>"
-"<h2>ESP32-S3 Firmware Update</h2>"
+"<h2>LineRobot ESP32 Firmware Update</h2>"
 "<input type='file' id='f' accept='.bin'><br><br>"
 "<button onclick='up()'>Upload</button><p id='s'></p>"
 "<script>"
@@ -29,7 +29,7 @@ static const char PAGE[] =
 "var x=new XMLHttpRequest();x.open('POST','/update');"
 "x.upload.onprogress=function(e){if(e.lengthComputable)s.innerText='Uploading '+Math.round(e.loaded*100/e.total)+'%';};"
 "x.onload=function(){s.innerText=x.responseText;};"
-"x.onerror=function(){s.innerText='Connection lost (ESP32-S3 may be rebooting)';};"
+"x.onerror=function(){s.innerText='Connection lost (ESP32 may be rebooting)';};"
 "x.send(f);}"
 "</script></body></html>";
 
@@ -93,7 +93,7 @@ static esp_err_t update_handler(httpd_req_t *req)
     }
 
     ESP_LOGI(TAG, "OTA update OK, rebooting...");
-    httpd_resp_sendstr(req, "Done! ESP32-S3 is rebooting...");
+    httpd_resp_sendstr(req, "Done! ESP32 is rebooting...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
@@ -101,13 +101,8 @@ static esp_err_t update_handler(httpd_req_t *req)
 
 void ota_boot_window(void)
 {
-<<<<<<< HEAD
-=======
-    // =========================================================
-    // 1. GPIO CONFIGURATION
-    // =========================================================
+    /* 1. Configure BOOT button GPIO */
     gpio_reset_pin(PIN_BOOT_BUTTON);
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BOOT_BUTTON,
         .mode         = GPIO_MODE_INPUT,
@@ -115,16 +110,9 @@ void ota_boot_window(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-
-<<<<<<< HEAD
-=======
     gpio_config(&btn);
 
-    // =========================================================
-    // 2. START WIFI ACCESS POINT
-    // =========================================================
-
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
+    /* 2. Start Wi-Fi SoftAP */
     if (wifi_ap_on(OTA_WIFI_SSID, OTA_WIFI_PASS) != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi AP failed to start, skipping OTA window");
         return;
@@ -167,6 +155,11 @@ void ota_boot_window(void)
 
         if (remaining_ticks > 0 && !s_busy && gpio_get_level(PIN_BOOT_BUTTON) == 0) {
             ESP_LOGI(TAG, "BOOT pressed -> skipping OTA window");
+            /* Wait until button is released so it doesn't bleed into IDLE mode */
+            while (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             break;
         }
 
@@ -175,20 +168,18 @@ void ota_boot_window(void)
             break;
         }
 
-<<<<<<< HEAD
-=======
-        // LED heartbeat: blink every 1000 ms.
+        /* LED1 heartbeat: blink every 1000 ms */
         usr_led_blink_poll(1000);
-
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+    usr_led_set(false);
     httpd_stop(server);
 
 #if !KEEP_WIFI_AP_AFTER_OTA
     wifi_ap_off();
+    ESP_LOGI(TAG, "OTA closed, Wi-Fi AP stopped");
+#else
+    ESP_LOGI(TAG, "OTA closed, keeping SoftAP '%s' active for MATLAB link", OTA_WIFI_SSID);
 #endif
-
-    ESP_LOGI(TAG, "OTA closed, handing SoftAP over to HIL");
 }

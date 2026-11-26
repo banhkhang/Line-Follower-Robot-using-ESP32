@@ -1,825 +1,345 @@
-<<<<<<< HEAD
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <math.h>
-#include <errno.h>
-=======
 /*
- * app.c - Lop ung dung chinh cua Line Follower Robot
+ * ============================================================================
+ * app.c - Lop ung dung chinh cua Line Follower Robot (He A + He B + Standalone)
+ * ============================================================================
  *
- * - Giu nguyen phien ban stable cua Wi-Fi AP, Telemetry UDP, OTA boot window
- *   va Loadcell HX711 tu nhanh main.
- * - Tich hop module dieu khien vong trong `drive_service` (Core 1, 200 Hz,
- *   2-DOF PI + M/T 1x + dong hoc vi sai + luat tham so theo tai trong) de
- *   san sang ghep bo dieu khien vong ngoai (Luenberger 100 Hz + SMC 20 Hz).
+ * KIEN TRUC TICH HOP 2 HE THONG TRONG 1 BAN FIRMWARE DUY NHAT (Runtime Profile):
+ *
+ *  [Khoi dong / Nhan nut EN (Reset)]:
+ *    1) Khoa cau H o trang thai Coast (Hi-Z) an toan ngay lap tuc.
+ *    2) Khoi tao LED1, NVS, Wi-Fi SoftAP ("LineRobot-AP", IP 192.168.4.1).
+ *    3) Mo cua so OTA (15 s; nhan BOOT de bo qua ngay). Giu SoftAP bat sau OTA.
+ *    4) Khoi chay vong trong `drive_service` (Core 1, 200 Hz, 2-DOF PI).
+ *    5) Nap hieu chuan 7 mat TCRT5000 tu NVS (bat profile 5S an toan voi Wi-Fi).
+ *    6) Khoi tao & Tare Loadcell HX711 (nhay LED1 2 s).
+ *    7) Vao che do mac dinh IDLE (Mode 1 - Wi-Fi ON cho lenh MATLAB, dong thoi
+ *       lang nghe nut BOOT cho Mode 2 & Hieu chuan 7 mat):
+ *
+ *  [Che do 1 - Ket noi MATLAB qua Wi-Fi]:
+ *    - Lenh START_A (He A): Dung 5 cam bien (S2..S6), giu Wi-Fi ON, dem nguoc 3 s,
+ *      chay vong ngoai SMC tren ESP32 va stream truc tiep du lieu 100 Hz ve MATLAB.
+ *    - Lenh START_B (He B): Gui ACK -> tat Wi-Fi -> chuyen profile 7 cam bien
+ *      (S1..S7) -> cap phat SRAM -> dem nguoc max(3s, t_switch) -> chay & log
+ *      vao SRAM. Khi dung o BAT KY 1 trong 3 kich ban [Stop] (mat line 2s /
+ *      sai so > 16mm 2s / dung tai dich du 2s): tat ADC2, bat lai Wi-Fi AP,
+ *      xac nhan ket noi MATLAB (PING) va cho lenh BURST_REQ de day toan bo SRAM!
+ *
+ *  [Che do 2 - Chay doc lap / Hieu chuan bang nut BOOT (khi dang IDLE)]:
+ *    - Nhan BOOT 1 lan (Single click) : Tat Wi-Fi -> 7 cam bien -> dem nguoc
+ *      max(3s, t_switch) -> chay do line doc lap (KHONG log data).
+ *    - Nhan BOOT 2 lan (Double click) : Tat Wi-Fi -> 5 cam bien -> dem nguoc
+ *      3s -> chay do line doc lap (KHONG log data).
+ *    - Giu BOOT >= 2.0 s (Long hold)  : Hieu chuan 7 cam bien & luu NVS:
+ *        * LED1 nhap nhay canh bao: BAT 1s, TAT 1s x 3 lan truoc khi tat Wi-Fi.
+ *        * Tat Wi-Fi, chuyen profile 7 mat, LED1 SANG LIEN TUC trong luc quet.
+ *        * Nhan BOOT them 1 lan khi quet xong -> luu NVS, tat LED1, bat lai Wi-Fi.
+ * ============================================================================
  */
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
 
 #include "app.h"
 #include "ota.h"
 #include "config.h"
+#include "robot_params.h"
 #include "wifi_ap.h"
-<<<<<<< HEAD
-#include "config.h"
-
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "esp_ota_ops.h"
-=======
-#include "telemetry.h"
-#include "loadcell_service.h"
-#include "sensor_service.h"
 #include "usr_led.h"
 #include "drive_service.h"
-#include "robot_params.h"
+#include "sensor_service.h"
+#include "loadcell_service.h"
+#include "data_logger.h"
+#include "mission_ctrl.h"
+#include "matlab_link.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "lwip/sockets.h"
-#include "lwip/inet.h"
-
-<<<<<<< HEAD
-static const char *TAG = "hil_app";
-
-/* ============================================================================
- * 1. SENSOR, MOTOR, OBSERVER & SMC CONSTANTS
- * ============================================================================ */
-static const float Y_SENS_M[7]       = {0.030f, 0.020f, 0.010f, 0.000f, -0.010f, -0.020f, -0.030f};
-static const float LINE_HALF_WIDTH_M = 0.013f;   /* Băng keo rộng 26 mm (a = 13 mm) */
-static const float OPT_SIGMA_PSF_M   = 0.0035f;  /* PSF TCRT5000 ở độ cao 5 mm      */
-static const float ADC_NOISE_FLOOR   = 0.085f;
-static const float LINE_LOSS_STOP_SEC = 2.0f;   /* Dừng khẩn cấp khi mất line liên tục >= 2 s */
-
-/* Bench-identified JGB37-520 (333 RPM) 2-DOF PI gains */
-static const float KFF_GAIN         = 86.23f;
-static const float PWM_DEADZONE_0   = 2.10f;
-static const float INT_BAND_BASE    = 0.035f;
-
-/* Variable-mass coupling parameters */
-static const float TAU_0_SEC        = 0.055f;
-static const float GAMMA_INERTIA    = 0.0384f;
-static const float K_PWM_ROLL       = 1.55f;
-
-static const float PWM_MAX_LIMIT    = 100.0f;
-static const float PWM_MIN_REVERSE  = -100.0f;
-
-/* Alpha-Beta pre-filter parameters */
-static const float WN_FILT          = 95.0f;
-static const float ZETA_FILT        = 0.92f;
-
-/* Adaptive Luenberger Observer poles (200 Hz) */
-static const float P1_SLOW          = 0.9292f;
-static const float P2_SLOW          = 0.9470f;
-static const float P1_FAST          = 0.8272f;
-static const float P2_FAST          = 0.8706f;
-static const float TAU_CURV_SEC     = 0.045f;
-static const float V_OBS_MIN_DENOM  = 0.25f;
-
-/* ============================================================================
- * 2. SHARED HIL STATE & SYNCHRONIZATION
- * ============================================================================ */
-typedef struct {
-    uint16_t sensor_adc[7];
-    uint8_t  mass_kg;
-    float    vL_meas_ms;
-    float    vR_meas_ms;
-    uint32_t last_rx_ms;
-    bool     link_active;
-    float    pwmL_cmd;
-    float    pwmR_cmd;
-} shared_hil_state_t;
-
-static shared_hil_state_t s_hil_state = { 0 };
-static portMUX_TYPE       s_state_mux = portMUX_INITIALIZER_UNLOCKED;
-static TaskHandle_t       s_control_task_handle = NULL;
-
-static inline uint32_t get_time_ms(void)
-{
-    return (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-/* ============================================================================
- * 3. GAUSS-NEWTON SINGLE-LINE TEMPLATE MATCHER (Y-JUNCTION)
- * ============================================================================ */
-static inline void eval_single_line_template_26mm(
-    float y_pos, float e_center, float *T_out, float *dT_out)
-{
-    const float inv_sqrt2_sig   = 1.0f / (1.41421356f * OPT_SIGMA_PSF_M);
-    const float inv_sqrt2pi_sig = 1.0f / (2.50662827f * OPT_SIGMA_PSF_M);
-
-    float d  = y_pos - e_center;
-    float u1 = (LINE_HALF_WIDTH_M - d) * inv_sqrt2_sig;
-    float u2 = (LINE_HALF_WIDTH_M + d) * inv_sqrt2_sig;
-
-    float raw = 0.5f * (erff(u1) + erff(u2)) - ADC_NOISE_FLOOR;
-    if (raw > 0.0f) {
-        *T_out  = raw;
-        *dT_out = inv_sqrt2pi_sig * (expf(-u1 * u1) - expf(-u2 * u2));
-    } else {
-        *T_out  = 0.0f;
-        *dT_out = 0.0f;
-    }
-}
-
-static bool compute_lateral_error_gauss_newton(
-    const uint16_t adc[7],
-    uint8_t mass_kg,
-    float e_pred_m,
-    float *e_lat_out_m,
-    float *total_I_out)
-{
-    float I_eff[7];
-    float total_I = 0.0f;
-    int num_clusters = 0;
-    bool in_cluster = false;
-
-    for (int i = 0; i < 7; i++) {
-        float norm = (float)adc[i] / 1023.0f - ADC_NOISE_FLOOR;
-        if (norm < 0.02f) norm = 0.0f;
-        I_eff[i] = norm;
-        total_I += norm;
-
-        if (norm > 0.12f) {
-            if (!in_cluster) {
-                num_clusters++;
-                in_cluster = true;
-            }
-        } else {
-            in_cluster = false;
-        }
-    }
-
-    if (total_I_out != NULL) {
-        *total_I_out = total_I;
-    }
-
-    if (total_I < 0.15f) {
-        return false;
-    }
-
-    float weighted_sum = 0.0f;
-    for (int i = 0; i < 7; i++) {
-        weighted_sum += Y_SENS_M[i] * I_eff[i];
-    }
-    float e_centroid = weighted_sum / total_I;
-
-    /* Khi mass_kg == 0 (chưa qua trạm tải) hoặc còn là 1 line đơn 26 mm (total_I <= 2.65)
-     * thì bám theo tâm hình học, tránh bị vạch ngang trạm tải kéo lệch. */
-    if (mass_kg == 0 || (num_clusters < 2 && total_I <= 2.65f)) {
-        *e_lat_out_m = e_centroid;
-        return true;
-    }
-
-    float branch_sign = (mass_kg == 1) ? 1.0f : -1.0f;
-    float e_est = e_pred_m + branch_sign * 0.0025f;
-
-    for (int iter = 0; iter < 3; iter++) {
-        float sum_w_dT2    = 1e-6f;
-        float sum_w_dT_res = 0.0f;
-
-        for (int k = 0; k < 7; k++) {
-            float T0 = 0.0f, dT = 0.0f;
-            eval_single_line_template_26mm(Y_SENS_M[k], e_est, &T0, &dT);
-
-            float res = I_eff[k] - T0;
-            float w = 1.0f;
-
-            /* Ưu tiên khóa vào mép ngoài sạch của nhánh mục tiêu, triệt ảnh hưởng nhánh còn lại */
-            float side_pos = branch_sign * (Y_SENS_M[k] - e_est);
-            if (side_pos < -0.008f && res > 0.03f) {
-                w = 0.0f;
-            } else if (side_pos < 0.000f && res > 0.04f) {
-                w = 0.15f;
-            }
-
-            sum_w_dT2    += w * dT * dT;
-            sum_w_dT_res += w * dT * res;
-        }
-
-        float step_e = sum_w_dT_res / sum_w_dT2;
-        if (step_e > 0.008f)  step_e = 0.008f;
-        if (step_e < -0.008f) step_e = -0.008f;
-        e_est += step_e;
-    }
-
-    if (e_est > 0.030f)  e_est = 0.030f;
-    if (e_est < -0.030f) e_est = -0.030f;
-
-    *e_lat_out_m = e_est;
-    return true;
-}
+static const char *TAG = "app";
 
 typedef enum {
-    MISSION_TO_LOAD = 0,     /* Chạy từ điểm xuất phát tới vạch ngang trạm tải */
-    MISSION_APPROACH_LOAD,   /* Tiến thêm 160 mm sau khi thấy vạch ngang vào tâm vùng tải */
-    MISSION_WAIT_LOAD,       /* Dừng Short Brake tại tâm vùng tải (X ~ 1005 mm) chờ nhận tải */
-    MISSION_TO_GOAL,         /* Bám line + tách nhánh Y tới đoạn thẳng cuối */
-    MISSION_GOAL_APPROACH,   /* Tầng 1: giảm tốc về 0.08 m/s & chờ sự kiện hết line (EOL) */
-    MISSION_GOAL_FINAL_STOP, /* Tầng 2: bò thẳng 70.8 mm theo quỹ đạo sqrt -> Short Brake */
-    MISSION_STOPPED_GOAL,    /* Đã dừng hẳn tại đích X = 3000 mm */
-    MISSION_STOPPED_LOST     /* Dừng khẩn cấp do mất line liên tục >= 2 s */
-} mission_state_t;
+    BTN_EVT_NONE = 0,
+    BTN_EVT_SINGLE_CLICK,
+    BTN_EVT_DOUBLE_CLICK,
+    BTN_EVT_LONG_HOLD
+} btn_event_t;
 
-/* Phát hiện vạch ngang: >= CROSSBAR_MIN_ACTIVE mắt cảm biến cùng vượt ngưỡng */
-static bool is_crossbar_detected(const uint16_t adc[7])
-{
-    int active_cnt = 0;
-    for (int i = 0; i < 7; i++) {
-        float norm = (float)adc[i] / 1023.0f - ADC_NOISE_FLOOR;
-        if (norm >= CROSSBAR_SENSOR_TH) {
-            active_cnt++;
-        }
-    }
-    return (active_cnt >= CROSSBAR_MIN_ACTIVE);
-}
-
-/* ============================================================================
- * 4. ADAPTIVE LUENBERGER OBSERVER
- * ============================================================================ */
+/* -------------------------------------------------------------------------- */
+/* Trinh phat hien cu chi nut BOOT (khong chan, goi moi 10 ms trong IDLE)     */
+/* -------------------------------------------------------------------------- */
 typedef struct {
-    float e2_hat;
-    float e3_hat;
-    float c_hat;
-} adaptive_observer_t;
+    bool     pressed;
+    bool     long_fired;
+    int64_t  press_start_ms;
+    int64_t  last_release_ms;
+    uint8_t  click_count;
+} boot_btn_fsm_t;
 
-static void observer_reset(adaptive_observer_t *obs, float e2_init)
+static inline int64_t now_ms(void)
 {
-    obs->e2_hat = e2_init;
-    obs->e3_hat = 0.0f;
-    obs->c_hat  = 0.0f;
+    return esp_timer_get_time() / 1000LL;
 }
 
-static void observer_update(adaptive_observer_t *obs, float e2_meas, float v_act, float w_act)
+static void boot_btn_init(boot_btn_fsm_t *fsm)
 {
-    if (fabsf(v_act) < 0.04f) {
-        obs->e2_hat = e2_meas;
-        return;
-    }
-
-    float v_denom = fmaxf(fabsf(v_act), V_OBS_MIN_DENOM);
-
-    float c_raw   = w_act / v_denom;
-    float alpha_c = TS_SEC / (TAU_CURV_SEC + TS_SEC);
-    obs->c_hat    = (1.0f - alpha_c) * obs->c_hat + alpha_c * c_raw;
-
-    float err_obs = e2_meas - obs->e2_hat;
-    float blend   = (fabsf(err_obs) - 0.0006f) / 0.0015f;
-    if (blend < 0.0f) blend = 0.0f;
-    if (blend > 1.0f) blend = 1.0f;
-
-    float p1 = (1.0f - blend) * P1_SLOW + blend * P1_FAST;
-    float p2 = (1.0f - blend) * P2_SLOW + blend * P2_FAST;
-
-    float Ld1 = 2.0f - (p1 + p2);
-    float Ld2 = (p1 * p2 - 1.0f + Ld1) / (v_denom * TS_SEC);
-
-    float w_net   = w_act - obs->c_hat * v_act;
-    float e2_pred = obs->e2_hat
-                  + v_act * TS_SEC * sinf(obs->e3_hat)
-                  - SENSOR_LOOKAHEAD_M * TS_SEC * w_act
-                  - 0.5f * v_act * (TS_SEC * TS_SEC) * w_net;
-    float e3_pred = obs->e3_hat - TS_SEC * w_net;
-
-    obs->e2_hat = e2_pred + Ld1 * err_obs;
-    obs->e3_hat = e3_pred + Ld2 * err_obs;
-
-    if (obs->e3_hat > 1.05f)  obs->e3_hat = 1.05f;
-    if (obs->e3_hat < -1.05f) obs->e3_hat = -1.05f;
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << PIN_BOOT_BUTTON,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn);
+    fsm->pressed         = false;
+    fsm->long_fired      = false;
+    fsm->press_start_ms  = 0;
+    fsm->last_release_ms = 0;
+    fsm->click_count     = 0;
 }
 
-/* ============================================================================
- * 5. MASS-ADAPTIVE 2-DOF PI MOTOR CONTROLLER
- * ============================================================================ */
-typedef struct {
-    float integral;
-    float prev_err;
-    float v_ref_shaped;
-} mass_adaptive_pi_t;
-
-static void motor_pi_reset(mass_adaptive_pi_t *pi)
+static btn_event_t boot_btn_poll(boot_btn_fsm_t *fsm)
 {
-    pi->integral     = 0.0f;
-    pi->prev_err     = 0.0f;
-    pi->v_ref_shaped = 0.0f;
-}
+    bool    is_down = (gpio_get_level(PIN_BOOT_BUTTON) == 0);
+    int64_t t       = now_ms();
 
-static float motor_pi_update(mass_adaptive_pi_t *pi, float v_ref_target, float v_meas, float m_total)
-{
-    float tau_eff = TAU_0_SEC + GAMMA_INERTIA * m_total;
-    float alpha_m = tau_eff / TAU_0_SEC;
-
-    /* Không kẹp slew-rate từng bánh để tránh trễ pha lệnh lái vi sai (v_base đã được ramp) */
-    float v_ref = v_ref_target;
-    pi->v_ref_shaped = v_ref_target;
-
-    float err = v_ref - v_meas;
-    /* ... giữ nguyên toàn bộ phần tính kp_eff, ki_eff, u_ff, anti-windup phía dưới ... */
-
-    /* Khi chạy STEP TEST tắt slew-rate để đo chính xác đáp ứng bậc thang Ts, OS% */
-#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
-    float v_ref = v_ref_target;
-    pi->v_ref_shaped = v_ref_target;
-#else
-    float accel_max = 1.8f / sqrtf(alpha_m);
-    float max_dv    = accel_max * TS_SEC;
-    float dv        = v_ref_target - pi->v_ref_shaped;
-    if (dv > max_dv)       dv = max_dv;
-    else if (dv < -max_dv) dv = -max_dv;
-    pi->v_ref_shaped += dv;
-    v_ref = pi->v_ref_shaped;
-#endif
-
-    err = v_ref - v_meas;
-
-    /* Khử cực đối tượng: zI = 1 / tau_eff => PM không đổi theo khối lượng */
-    float kp_eff   = INNER_LOOP_WGC * tau_eff * KFF_GAIN;
-    float ki_eff   = INNER_LOOP_WGC * KFF_GAIN;
-    float int_band = INT_BAND_BASE * sqrtf(alpha_m);
-
-    float pwm_comp = PWM_DEADZONE_0 + K_PWM_ROLL * m_total;
-    float u_ff     = 0.0f;
-    if (v_ref > 0.005f)       u_ff = KFF_GAIN * v_ref + pwm_comp;
-    else if (v_ref < -0.005f) u_ff = KFF_GAIN * v_ref - pwm_comp;
-
-    float u_p         = kp_eff * err;
-    float pwm_min_dyn = (v_ref >= 0.0f) ? 0.0f : PWM_MIN_REVERSE;
-
-    float i_candidate = pi->integral;
-    if (fabsf(err) < int_band) {
-        i_candidate += ki_eff * (0.5f * TS_SEC) * (err + pi->prev_err);
-    }
-
-    float u_unsat = u_ff + u_p + i_candidate;
-    if (u_unsat > PWM_MAX_LIMIT) {
-        if (err < 0.0f && fabsf(err) < int_band) pi->integral = i_candidate;
-        u_unsat = PWM_MAX_LIMIT;
-    } else if (u_unsat < pwm_min_dyn) {
-        if (err > 0.0f && fabsf(err) < int_band) pi->integral = i_candidate;
-        u_unsat = pwm_min_dyn;
+    if (is_down) {
+        if (!fsm->pressed) {
+            fsm->pressed        = true;
+            fsm->long_fired     = false;
+            fsm->press_start_ms = t;
+        } else if (!fsm->long_fired && (t - fsm->press_start_ms) >= (int64_t)BTN_LONG_HOLD_MS) {
+            fsm->long_fired  = true;
+            fsm->click_count = 0;
+            return BTN_EVT_LONG_HOLD;
+        }
     } else {
-        pi->integral = i_candidate;
-    }
-
-    pi->prev_err = err;
-    return u_unsat;
-}
-
-/* ============================================================================
- * 6. CORE 1 REAL-TIME CONTROL TASK (200 Hz via esp_timer)
- * ============================================================================ */
-static void on_control_timer(void *arg)
-{
-    (void)arg;
-    if (s_control_task_handle != NULL) {
-        xTaskNotifyGive(s_control_task_handle);
-    }
-}
-
-#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
-/* Quỹ đạo kiểm thử chuẩn 7.0 s:
- *  0.0 - 0.8 s: S-curve bậc 3 (0 -> 0.50 m/s)
- *  0.8 - 1.8 s: Giữ 0.50 m/s
- *  1.8 - 2.8 s: Bước nhảy lên 0.70 m/s
- *  2.8 - 3.8 s: Bước nhảy xuống 0.50 m/s
- *  3.8 - 4.8 s: Bước nhảy xuống 0.30 m/s
- *  4.8 - 5.8 s: Bước nhảy lên 0.50 m/s
- *  5.8 - 7.0 s: Phanh về 0.00 m/s (kiểm tra dừng)
- */
-static float eval_inner_step_profile(float t_sec)
-{
-    if (t_sec < 0.8f) {
-        float tau = t_sec / 0.8f;
-        return 0.50f * (3.0f * tau * tau - 2.0f * tau * tau * tau);
-    } else if (t_sec < 1.8f) {
-        return 0.50f;
-    } else if (t_sec < 2.8f) {
-        return 0.70f;
-    } else if (t_sec < 3.8f) {
-        return 0.50f;
-    } else if (t_sec < 4.8f) {
-        return 0.30f;
-    } else if (t_sec < 5.8f) {
-        return 0.50f;
-    } else {
-        return 0.00f;
-    }
-}
-#endif
-
-typedef struct {
-    adaptive_observer_t observer;
-    mass_adaptive_pi_t  motor_ctrl_L;
-    mass_adaptive_pi_t  motor_ctrl_R;
-    float alpha_ab;
-    float beta_ab;
-    float e2_filt;
-    float de2_filt;
-    float e2_prev_smc;
-    float z_int_smc;
-    float active_time;
-    bool  was_active;
-    mission_state_t mission_state;
-    float crossbar_timer;
-    float state_timer;
-    float line_loss_timer;
-    float load_dist_m;
-    float ramp_timer;
-    float v_base_shaped;
-    float s_from_crossbar;
-    float eol_timer;
-    float goal_creep_dist_m;
-} hil_ctrl_ctx_t;
-
-static void hil_ctx_reset(hil_ctrl_ctx_t *ctx)
-{
-    ctx->alpha_ab = 1.0f - expf(-2.0f * ZETA_FILT * WN_FILT * TS_SEC);
-    ctx->beta_ab  = (WN_FILT * TS_SEC) * (WN_FILT * TS_SEC);
-    observer_reset(&ctx->observer, 0.0f);
-    motor_pi_reset(&ctx->motor_ctrl_L);
-    motor_pi_reset(&ctx->motor_ctrl_R);
-    ctx->e2_filt         = 0.0f;
-    ctx->de2_filt        = 0.0f;
-    ctx->e2_prev_smc     = 0.0f;
-    ctx->z_int_smc       = 0.0f;
-    ctx->active_time     = 0.0f;
-    ctx->was_active      = false;
-    ctx->mission_state   = MISSION_TO_LOAD;
-    ctx->crossbar_timer  = 0.0f;
-    ctx->state_timer     = 0.0f;
-    ctx->line_loss_timer = 0.0f;
-    ctx->load_dist_m       = 0.0f;
-    ctx->ramp_timer        = 0.0f;
-    ctx->v_base_shaped     = 0.0f;
-    ctx->s_from_crossbar   = 0.0f;
-    ctx->eol_timer         = 0.0f;
-    ctx->goal_creep_dist_m = 0.0f;
-}
-
-/* Thực hiện đúng 1 bước điều khiển Ts = 0.005 s đồng bộ 1:1 với gói UDP từ Simulink */
-static void hil_control_step(
-    hil_ctrl_ctx_t *ctx,
-    const uint16_t adc_local[7],
-    uint8_t mass_local,
-    float vL_meas,
-    float vR_meas,
-    float *pwmL_out,
-    float *pwmR_out)
-{
-    ctx->active_time += TS_SEC;
-
-#if HIL_RUN_MODE == MODE_INNER_STEP_TEST
-    (void)adc_local;
-    ctx->was_active = true;
-    float v_ref   = eval_inner_step_profile(ctx->active_time);
-    float m_total = M_CHASSIS_KG + (float)mass_local;
-    *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref, vL_meas, m_total);
-    *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref, vR_meas, m_total);
-#else
-    ctx->state_timer += TS_SEC;
-    ctx->ramp_timer  += TS_SEC;
-
-    float v_act = 0.5f * (vR_meas + vL_meas);
-    float w_act = (vR_meas - vL_meas) / TRACK_WIDTH_M;
-
-    /* Tích lũy odometry liên tục từ thời điểm xác nhận vạch ngang trạm tải */
-    if (ctx->mission_state >= MISSION_APPROACH_LOAD &&
-        ctx->mission_state <= MISSION_GOAL_APPROACH) {
-        ctx->s_from_crossbar += fmaxf(v_act, 0.0f) * TS_SEC;
-    }
-
-    /* Các trạng thái đã dừng hẳn: giữ Short Brake (0% PWM) */
-    if (ctx->mission_state == MISSION_STOPPED_GOAL ||
-        ctx->mission_state == MISSION_STOPPED_LOST) {
-        *pwmL_out = 0.0f;
-        *pwmR_out = 0.0f;
-        motor_pi_reset(&ctx->motor_ctrl_L);
-        motor_pi_reset(&ctx->motor_ctrl_R);
-        return;
-    }
-
-    bool crossbar_raw = is_crossbar_detected(adc_local);
-    ctx->crossbar_timer = crossbar_raw ? (ctx->crossbar_timer + TS_SEC) : 0.0f;
-    bool crossbar_confirmed = (ctx->crossbar_timer >= CROSSBAR_DEBOUNCE_SEC);
-
-    float e2_pred = ctx->e2_filt + ctx->de2_filt * TS_SEC;
-    float e2_raw  = e2_pred;
-    float total_I = 0.0f;
-    bool  line_ok = compute_lateral_error_gauss_newton(
-                        adc_local, mass_local, e2_pred, &e2_raw, &total_I);
-
-    if (!ctx->was_active && line_ok) {
-        ctx->e2_filt     = e2_raw;
-        ctx->e2_prev_smc = e2_raw;
-        observer_reset(&ctx->observer, e2_raw);
-        ctx->was_active  = true;
-    }
-
-    if (line_ok) {
-        float res     = e2_raw - e2_pred;
-        ctx->e2_filt  = e2_pred + ctx->alpha_ab * res;
-        ctx->de2_filt = ctx->de2_filt + (ctx->beta_ab / TS_SEC) * res;
-    } else {
-        ctx->e2_filt   = e2_pred;
-        ctx->de2_filt *= 0.90f;
-    }
-    observer_update(&ctx->observer, ctx->e2_filt, v_act, w_act);
-
-    /* Dừng khẩn cấp nếu mất line liên tục >= 2 s (trừ giai đoạn chờ tải & bò đích) */
-    if (ctx->mission_state != MISSION_WAIT_LOAD &&
-        ctx->mission_state != MISSION_GOAL_FINAL_STOP) {
-        ctx->line_loss_timer = line_ok ? 0.0f : (ctx->line_loss_timer + TS_SEC);
-        if (ctx->line_loss_timer >= LINE_LOSS_STOP_SEC) {
-            ctx->mission_state = MISSION_STOPPED_LOST;
-            *pwmL_out = 0.0f;
-            *pwmR_out = 0.0f;
-            motor_pi_reset(&ctx->motor_ctrl_L);
-            motor_pi_reset(&ctx->motor_ctrl_R);
-            ESP_LOGW(TAG, "Line lost >= %.1f s -> Emergency Short Brake", LINE_LOSS_STOP_SEC);
-            return;
+        if (fsm->pressed) {
+            int64_t dur = t - fsm->press_start_ms;
+            fsm->pressed = false;
+            if (!fsm->long_fired && dur >= (int64_t)BTN_DEBOUNCE_MS) {
+                fsm->click_count++;
+                fsm->last_release_ms = t;
+                if (fsm->click_count >= 2) {
+                    fsm->click_count = 0;
+                    return BTN_EVT_DOUBLE_CLICK;
+                }
+            }
+        } else if (fsm->click_count == 1 && (t - fsm->last_release_ms) >= (int64_t)BTN_DOUBLE_CLICK_MS) {
+            fsm->click_count = 0;
+            return BTN_EVT_SINGLE_CLICK;
         }
     }
+    return BTN_EVT_NONE;
+}
 
-    /* ---- Máy trạng thái nhiệm vụ (Trạm tải + Đích 2 tầng) ---- */
-    switch (ctx->mission_state) {
-        case MISSION_TO_LOAD:
-            if (ctx->active_time > 0.5f && crossbar_confirmed) {
-                ctx->mission_state   = MISSION_APPROACH_LOAD;
-                ctx->load_dist_m     = 0.0f;
-                ctx->s_from_crossbar = 0.0f;
-                ctx->state_timer     = 0.0f;
-                ESP_LOGI(TAG, "Crossbar detected -> approaching loading center");
-            }
-            break;
+/* -------------------------------------------------------------------------- */
+/* Chuyen doi Wi-Fi <-> Profile cam bien an toan (tranh xung dot ADC2)        */
+/* -------------------------------------------------------------------------- */
 
-        case MISSION_APPROACH_LOAD:
-            ctx->load_dist_m += fmaxf(v_act, 0.0f) * TS_SEC;
-            if (ctx->load_dist_m >= LOAD_APPROACH_DIST_M) {
-                ctx->mission_state = MISSION_WAIT_LOAD;
-                ctx->state_timer   = 0.0f;
-                motor_pi_reset(&ctx->motor_ctrl_L);
-                motor_pi_reset(&ctx->motor_ctrl_R);
-                ctx->z_int_smc     = 0.0f;
-                ctx->v_base_shaped = 0.0f;
-                ESP_LOGI(TAG, "Loading center reached -> Short Brake & dwell %.1f s",
-                         LOAD_STOP_DWELL_SEC);
-            }
-            break;
+/* Tat MATLAB link & Wi-Fi, chuyen TCRT5000 sang profile mong muon; tra ve t_switch [ms] */
+static uint32_t switch_to_offline_profile(tcrt_profile_t target_profile)
+{
+    int64_t t0 = esp_timer_get_time();
 
-        case MISSION_WAIT_LOAD:
-            *pwmL_out = 0.0f;
-            *pwmR_out = 0.0f;
-            motor_pi_reset(&ctx->motor_ctrl_L);
-            motor_pi_reset(&ctx->motor_ctrl_R);
-            ctx->z_int_smc     = 0.0f;
-            ctx->v_base_shaped = 0.0f;
-            observer_reset(&ctx->observer, ctx->e2_filt);
+    matlab_link_stop();
+    wifi_ap_off();
+    vTaskDelay(pdMS_TO_TICKS(50)); /* Cho phan cung RF nha hoan toan ADC2 */
 
-            if (ctx->state_timer >= LOAD_STOP_DWELL_SEC) {
-                ctx->mission_state = MISSION_TO_GOAL;
-                ctx->state_timer   = 0.0f;
-                ctx->ramp_timer    = 0.0f;
-                ESP_LOGI(TAG, "Departing loading zone (mass = %u kg, s_cb = %.3f m)",
-                         mass_local, ctx->s_from_crossbar);
-            }
-            return;
-
-        case MISSION_TO_GOAL:
-            if (ctx->s_from_crossbar >= GOAL_DECEL_START_M) {
-                ctx->mission_state = MISSION_GOAL_APPROACH;
-                ctx->eol_timer     = 0.0f;
-                ctx->state_timer   = 0.0f;
-                ESP_LOGI(TAG, "Stage 1 Goal Approach (s_cb = %.3f m) -> decel to %.2f m/s",
-                         ctx->s_from_crossbar, GOAL_CREEP_SPEED_MS);
-            } else if (ctx->s_from_crossbar >= GOAL_ARM_DIST_M && !line_ok) {
-                /* Dự phòng trường hợp odometry chậm hơn thực tế và gặp EOL sớm */
-                ctx->eol_timer += TS_SEC;
-                if (ctx->eol_timer >= GOAL_EOL_DEBOUNCE_SEC) {
-                    ctx->mission_state     = MISSION_GOAL_FINAL_STOP;
-                    ctx->goal_creep_dist_m = 0.0f;
-                    ctx->state_timer       = 0.0f;
-                    ESP_LOGI(TAG, "Early EOL latched (s_cb = %.3f m) -> Stage 2 final creep",
-                             ctx->s_from_crossbar);
-                }
-            } else {
-                ctx->eol_timer = 0.0f;
-            }
-            break;
-
-        case MISSION_GOAL_APPROACH:
-            ctx->eol_timer = (!line_ok) ? (ctx->eol_timer + TS_SEC) : 0.0f;
-            if (ctx->eol_timer >= GOAL_EOL_DEBOUNCE_SEC) {
-                ctx->mission_state     = MISSION_GOAL_FINAL_STOP;
-                ctx->goal_creep_dist_m = 0.0f;
-                ctx->state_timer       = 0.0f;
-                ESP_LOGI(TAG, "EOL latched (s_cb = %.3f m, v = %.3f m/s) -> Stage 2 creep %.1f mm",
-                         ctx->s_from_crossbar, v_act, GOAL_EOL_OFFSET_M * 1000.0f);
-            }
-            break;
-
-        case MISSION_GOAL_FINAL_STOP:
-        default:
-            break;
+    esp_err_t err = sensor_service_set_profile(target_profile);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to switch sensor profile to %dS: %s",
+                 (int)target_profile, esp_err_to_name(err));
     }
 
-    /* ---- Tầng 2: Bò thẳng chính xác 70.8 mm theo quỹ đạo sqrt -> Short Brake ---- */
-    if (ctx->mission_state == MISSION_GOAL_FINAL_STOP) {
-        ctx->goal_creep_dist_m += fmaxf(v_act, 0.0f) * TS_SEC;
-        float d_rem = GOAL_EOL_OFFSET_M - ctx->goal_creep_dist_m;
+    uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000LL);
+    ESP_LOGI(TAG, "Switched offline to %d-sensor profile in %lu ms",
+             (int)target_profile, (unsigned long)elapsed_ms);
+    return elapsed_ms;
+}
 
-        if (d_rem <= GOAL_STOP_BAND_M) {
-            ctx->mission_state = MISSION_STOPPED_GOAL;
-            ctx->state_timer   = 0.0f;
-            *pwmL_out = 0.0f;
-            *pwmR_out = 0.0f;
-            motor_pi_reset(&ctx->motor_ctrl_L);
-            motor_pi_reset(&ctx->motor_ctrl_R);
-            ESP_LOGI(TAG, "GOAL STOPPED (s_cb = %.3f m, creep = %.1f mm)",
-                     ctx->s_from_crossbar, ctx->goal_creep_dist_m * 1000.0f);
-            return;
-        }
+/* Nha ADC2 (ve 5S), bat lai Wi-Fi SoftAP & khoi dong lai MATLAB UDP link */
+static void restore_online_wifi_mode(app_link_state_t target_state)
+{
+    /* Bat buoc nha ADC2 truoc khi bat Wi-Fi! */
+    sensor_service_set_profile(TCRT_PROFILE_5S);
 
-        float v_prof  = sqrtf(2.0f * GOAL_FINAL_DECEL_MS2 * fmaxf(d_rem, 0.0f));
-        float v_cmd   = fminf(GOAL_CREEP_SPEED_MS, fmaxf(v_prof, GOAL_MIN_CREEP_MS));
-        float m_total = M_CHASSIS_KG + (float)mass_local;
-
-        *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_cmd, vL_meas, m_total);
-        *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_cmd, vR_meas, m_total);
-        return;
+    esp_err_t err = wifi_ap_on(ROBOT_WIFI_SSID, ROBOT_WIFI_PASS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to restart Wi-Fi SoftAP: %s", esp_err_to_name(err));
     }
 
-    /* ---- Vòng ngoài bám line (gồm cả Tầng 1 giảm tốc tiếp cận đích) ---- */
-    float v_target = 0.0f;
-    float decel_limit = LONGITUDINAL_ACCEL_MAX;
+    matlab_link_set_app_state(target_state);
+    if (matlab_link_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to restart MATLAB UDP link");
+    }
+}
 
-    if (ctx->mission_state == MISSION_GOAL_APPROACH) {
-        v_target    = GOAL_CREEP_SPEED_MS;
-        decel_limit = GOAL_DECEL_RATE_MS2;
+/* -------------------------------------------------------------------------- */
+/* Quy trinh hieu chuan 7 cam bien & luu NVS (co chuoi LED1 1s ON/OFF x 3)    */
+/* -------------------------------------------------------------------------- */
+static void run_calibration_workflow(void)
+{
+    ESP_LOGI(TAG, "=== ENTERING 7-SENSOR CALIBRATION WORKFLOW ===");
+    matlab_link_set_app_state(APP_STATE_CALIB);
+
+    /* Doi nguoi dung tha nut BOOT sau khi giu 2s */
+    while (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    /* Truoc khi tat Wi-Fi: LED1 BAT 1s, TAT 1s lap lai 3 lan theo yeu cau */
+    for (int i = 0; i < CALIB_PRELUDE_CYCLES; i++) {
+        ESP_LOGI(TAG, "Calib prelude %d/%d (LED1 ON 1s / OFF 1s)", i + 1, CALIB_PRELUDE_CYCLES);
+        usr_led_set(true);
+        vTaskDelay(pdMS_TO_TICKS(CALIB_PRELUDE_ON_MS));
+        usr_led_set(false);
+        vTaskDelay(pdMS_TO_TICKS(CALIB_PRELUDE_OFF_MS));
+    }
+
+    /* Tat Wi-Fi -> chuyen sang 7 cam bien -> quet (LED1 sang lien tuc -> xong tat LED1) */
+    switch_to_offline_profile(TCRT_PROFILE_7S);
+    esp_err_t err = sensor_service_calibrate_sweep();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "7-sensor calibration saved to NVS successfully");
     } else {
-        float v_ramp   = V_CRUISE_MAX * fminf(1.0f, ctx->ramp_timer / 0.35f);
-        float err_norm = fminf(fabsf(ctx->e2_filt) / 0.024f, 1.0f);
-        float v_turn   = V_CRUISE_MAX - (V_CRUISE_MAX - V_CRUISE_MIN) * err_norm;
-        v_target       = fminf(v_ramp, v_turn);
+        ESP_LOGE(TAG, "Calibration failed (%s)", esp_err_to_name(err));
     }
 
-    float max_dv_up   = LONGITUDINAL_ACCEL_MAX * TS_SEC;
-    float max_dv_down = decel_limit * TS_SEC;
-    float dv_lon      = v_target - ctx->v_base_shaped;
-    if (dv_lon > max_dv_up)         dv_lon = max_dv_up;
-    else if (dv_lon < -max_dv_down) dv_lon = -max_dv_down;
-    ctx->v_base_shaped += dv_lon;
-    float v_base = ctx->v_base_shaped;
-
-    if (ctx->ramp_timer > 0.25f && line_ok && ctx->mission_state != MISSION_GOAL_APPROACH) {
-        ctx->z_int_smc += KI_SMC_GAIN * ctx->e2_filt * TS_SEC;
-        if (ctx->z_int_smc > Z_INT_MAX_M)  ctx->z_int_smc = Z_INT_MAX_M;
-        if (ctx->z_int_smc < -Z_INT_MAX_M) ctx->z_int_smc = -Z_INT_MAX_M;
-    } else if (ctx->mission_state == MISSION_GOAL_APPROACH) {
-        ctx->z_int_smc *= 0.95f;
-    }
-
-    float de2_clean = (ctx->e2_filt - ctx->e2_prev_smc) / TS_SEC;
-    ctx->e2_prev_smc = ctx->e2_filt;
-
-    float w_raw = 0.0f;
-    /* Khi sắp chạm mép hết line ở Tầng 1, khóa lái thẳng để nhiễu cạnh không làm lệch hướng */
-    if (!(ctx->mission_state == MISSION_GOAL_APPROACH && total_I < GOAL_STEER_FREEZE_I)) {
-        float sigma     = ctx->e2_filt + KD_RATE_SEC * de2_clean + ctx->z_int_smc;
-        float sat_sigma = fminf(fmaxf(sigma / PHI_BL_M, -1.0f), 1.0f);
-        float alpha_str = fminf(1.0f, fmaxf(0.20f, v_base / V_CRUISE_MAX));
-        w_raw = (v_base * sinf(ctx->observer.e3_hat)
-                + alpha_str * (K1_KINEMATIC * ctx->e2_filt + K_SMC_GAIN * sat_sigma))
-                / SENSOR_LOOKAHEAD_M;
-        w_raw = fminf(fmaxf(w_raw, -OMEGA_MAX_RADS), OMEGA_MAX_RADS);
-    }
-
-    float half_B  = 0.5f * TRACK_WIDTH_M;
-    float v_ref_L = fminf(fmaxf(v_base - half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
-    float v_ref_R = fminf(fmaxf(v_base + half_B * w_raw, V_WHEEL_MIN), V_WHEEL_MAX);
-    float m_total = M_CHASSIS_KG + (float)mass_local;
-
-    *pwmL_out = motor_pi_update(&ctx->motor_ctrl_L, v_ref_L, vL_meas, m_total);
-    *pwmR_out = motor_pi_update(&ctx->motor_ctrl_R, v_ref_R, vR_meas, m_total);
-#endif
+    /* Bat lai Wi-Fi & tro ve trang thai IDLE */
+    restore_online_wifi_mode(APP_STATE_IDLE);
 }
 
-/* ============================================================================
- * 7. CORE 0 LWIP UDP NETWORK TASK
- * ============================================================================ */
-static void send_udp_packet(int sock, const struct sockaddr_in *dest_addr, float pwmL, float pwmR)
+/* -------------------------------------------------------------------------- */
+/* Chay He A (5S + Live Stream Wi-Fi lien tuc voi MATLAB)                     */
+/* -------------------------------------------------------------------------- */
+static void run_system_a(void)
 {
-    int16_t pwmL_scaled = (int16_t)lroundf(fminf(fmaxf(pwmL, -100.0f), 100.0f) * 100.0f);
-    int16_t pwmR_scaled = (int16_t)lroundf(fminf(fmaxf(pwmR, -100.0f), 100.0f) * 100.0f);
+    ESP_LOGI(TAG, "=== SYSTEM A: 5 SENSORS + LIVE WI-FI STREAM ===");
+    sensor_service_set_profile(TCRT_PROFILE_5S);
+    matlab_link_set_app_state(APP_STATE_RUNNING_A);
 
-    uint8_t tx_buf[HIL_TX_PACKET_LEN];
-    tx_buf[0] = 0xBB;
-    tx_buf[1] = (uint8_t)(pwmL_scaled & 0xFF);
-    tx_buf[2] = (uint8_t)((pwmL_scaled >> 8) & 0xFF);
-    tx_buf[3] = (uint8_t)(pwmR_scaled & 0xFF);
-    tx_buf[4] = (uint8_t)((pwmR_scaled >> 8) & 0xFF);
-    tx_buf[5] = tx_buf[1] ^ tx_buf[2] ^ tx_buf[3] ^ tx_buf[4];
+    mission_run_cfg_t cfg = {
+        .mode             = RUN_MODE_SYS_A_5S_LIVE,
+        .sensor_profile   = TCRT_PROFILE_5S,
+        .enable_sram_log  = false,
+        .live_cb          = matlab_link_send_live_sample,
+        .countdown_rem_ms = RUN_COUNTDOWN_MIN_MS  /* Dem nguoc dung 3.0 s */
+    };
 
-    sendto(sock, tx_buf, HIL_TX_PACKET_LEN, 0,
-           (const struct sockaddr *)dest_addr, sizeof(*dest_addr));
+    robot_run_summary_t summary;
+    mission_ctrl_run_blocking(&cfg, &summary);
+
+    matlab_link_set_app_state(APP_STATE_IDLE);
+    matlab_link_send_status_now();
 }
 
-static void network_task(void *pvParameters)
+/* -------------------------------------------------------------------------- */
+/* Chay He B (7S + Log SRAM + Bat Wi-Fi Burst khi dung o ca 3 kich ban)       */
+/* -------------------------------------------------------------------------- */
+static void run_system_b(void)
 {
-    (void)pvParameters;
+    ESP_LOGI(TAG, "=== SYSTEM B: 7 SENSORS + SRAM LOG + WI-FI BURST ===");
+    /* Cho 120 ms de goi PKT_ACK gui xong qua Wi-Fi truoc khi ngat radio */
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Socket create failed: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
+    uint32_t t_switch_ms = switch_to_offline_profile(TCRT_PROFILE_7S);
 
-    struct sockaddr_in local_addr = { 0 };
-    local_addr.sin_family      = AF_INET;
-    local_addr.sin_port        = htons(ESP_UDP_PORT);
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    /* Cap phat bo dem SRAM (luon giu >= 88 KB DRAM trong cho pha bat Wi-Fi burst) */
+    bool sram_ok = (data_logger_prepare(SYSTEM_B_LOG_MAX_SAMPLES) == ESP_OK);
 
-    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        ESP_LOGE(TAG, "Socket bind failed: errno %d", errno);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
+    /* Doi max(3s, thoi gian chuyen sang profile 7 cam bien) */
+    uint32_t rem_ms = (t_switch_ms < RUN_COUNTDOWN_MIN_MS)
+                          ? (RUN_COUNTDOWN_MIN_MS - t_switch_ms)
+                          : 0U;
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    mission_run_cfg_t cfg = {
+        .mode             = RUN_MODE_SYS_B_7S_BURST,
+        .sensor_profile   = TCRT_PROFILE_7S,
+        .enable_sram_log  = sram_ok,
+        .live_cb          = NULL,
+        .countdown_rem_ms = rem_ms
+    };
 
-    hil_ctrl_ctx_t ctx;
-    hil_ctx_reset(&ctx);
+    robot_run_summary_t summary;
+    robot_stop_reason_t reason = mission_ctrl_run_blocking(&cfg, &summary);
 
-    uint8_t rx_buf[64];
-    struct sockaddr_in src_addr;
-    struct sockaddr_in pc_dest = { 0 };
-    pc_dest.sin_family = AF_INET;
-    pc_dest.sin_port   = htons(PC_UDP_PORT);
+    /*
+     * Trong CA 3 kich ban dung (mat line 2s / |e2|>16mm 2s / dung dich du 2s)
+     * va ca khi dung thu cong: bat lai Wi-Fi, xac nhan ket noi MATLAB va cho
+     * lenh BURST_REQ tu MATLAB de truyen toan bo du lieu SRAM!
+     */
+    ESP_LOGI(TAG, "System B stopped (reason=%d, samples=%lu). Re-enabling Wi-Fi for MATLAB burst...",
+             (int)reason, (unsigned long)data_logger_count());
 
-    uint32_t last_rx_ms = 0;
-    bool     active     = false;
+    restore_online_wifi_mode(APP_STATE_WAIT_BURST);
+    usr_led_start_blink(500); /* Nhay cham 0.5s bao hieu dang cho MATLAB nhan burst */
 
-    ESP_LOGI(TAG, "LOCKSTEP HIL UDP ready on port %d -> PC port %d", ESP_UDP_PORT, PC_UDP_PORT);
-
-    for (;;) {
-        socklen_t socklen = sizeof(src_addr);
-        int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0,
-                           (struct sockaddr *)&src_addr, &socklen);
-
-        uint32_t now_ms = get_time_ms();
-
-        if (len == HIL_RX_PACKET_LEN && rx_buf[0] == 0xAA) {
-            uint8_t cs = 0;
-            for (int k = 1; k <= 19; k++) cs ^= rx_buf[k];
-
-            if (cs == rx_buf[20]) {
-                /* Tự động reset sạch khi bắt đầu lượt chạy Simulink mới */
-                if (!active || (now_ms - last_rx_ms) > HIL_FAILSAFE_MS) {
-                    hil_ctx_reset(&ctx);
-                    active = true;
-                    ESP_LOGI(TAG, "LOCKSTEP HIL SESSION START (payload = %u kg)", rx_buf[15]);
-                }
-                last_rx_ms = now_ms;
-
-                uint16_t adc_tmp[7];
-                for (int i = 0; i < 7; i++) {
-                    adc_tmp[i] = (uint16_t)rx_buf[2 * i + 1]
-                               | ((uint16_t)rx_buf[2 * i + 2] << 8);
-                }
-                uint8_t mass_tmp = rx_buf[15];
-                int16_t vL_mms   = (int16_t)((uint16_t)rx_buf[16] | ((uint16_t)rx_buf[17] << 8));
-                int16_t vR_mms   = (int16_t)((uint16_t)rx_buf[18] | ((uint16_t)rx_buf[19] << 8));
-
-                float pwmL_tx = 0.0f, pwmR_tx = 0.0f;
-                hil_control_step(&ctx, adc_tmp, mass_tmp,
-                                 (float)vL_mms * 0.001f, (float)vR_mms * 0.001f,
-                                 &pwmL_tx, &pwmR_tx);
-
-                pc_dest.sin_addr = src_addr.sin_addr;
-                send_udp_packet(sock, &pc_dest, pwmL_tx, pwmR_tx);
-            }
-        } else if (active && (now_ms - last_rx_ms) > HIL_FAILSAFE_MS) {
-            active = false;
-            hil_ctx_reset(&ctx);
-            ESP_LOGW(TAG, "LOCKSTEP HIL SESSION ENDED -> Reset ready for next run");
+    while (1) {
+        matlab_action_t act = matlab_link_take_action();
+        if (act == MATLAB_ACT_BURST_DONE) {
+            ESP_LOGI(TAG, "Burst transfer completed by MATLAB -> freeing SRAM & returning IDLE");
+            break;
         }
+        /* Neu nguoi dung giu BOOT >= 1s trong luc cho burst -> huy cho va ve IDLE */
+        if (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+                ESP_LOGW(TAG, "BOOT held -> aborting burst wait & returning IDLE");
+                while (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
+
+    usr_led_set(false);
+    data_logger_free();
+    matlab_link_set_app_state(APP_STATE_IDLE);
+    matlab_link_send_status_now();
 }
 
-/* ============================================================================
- * 8. APPLICATION ENTRY POINT
- * ============================================================================ */
-void app_start(void)
+/* -------------------------------------------------------------------------- */
+/* Chay Doc lap bang nut BOOT (Mode 2: 7S hoac 5S, KHONG log data)            */
+/* -------------------------------------------------------------------------- */
+static void run_standalone(tcrt_profile_t profile)
 {
-    ESP_LOGI(TAG, "Reset reason: %d", (int)esp_reset_reason());
+    ESP_LOGI(TAG, "=== STANDALONE MODE (NO LOG): %d SENSORS ===", (int)profile);
+    uint32_t t_switch_ms = switch_to_offline_profile(profile);
 
+    uint32_t rem_ms = (t_switch_ms < RUN_COUNTDOWN_MIN_MS)
+                          ? (RUN_COUNTDOWN_MIN_MS - t_switch_ms)
+                          : 0U;
+
+    mission_run_cfg_t cfg = {
+        .mode             = (profile == TCRT_PROFILE_7S)
+                                ? RUN_MODE_STANDALONE_7S
+                                : RUN_MODE_STANDALONE_5S,
+        .sensor_profile   = profile,
+        .enable_sram_log  = false,
+        .live_cb          = NULL,
+        .countdown_rem_ms = rem_ms
+    };
+
+    robot_run_summary_t summary;
+    mission_ctrl_run_blocking(&cfg, &summary);
+
+    /* Sau khi dung xe: bat lai Wi-Fi AP ve che do IDLE san sang cho luot tiep theo */
+    restore_online_wifi_mode(APP_STATE_IDLE);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Khoi tao he thong & Vong lap dieu phoi chinh                               */
+/* -------------------------------------------------------------------------- */
+static void system_init(void)
+{
+    /* 0. AN TOAN PHAN CUNG: Khoa cau H o trang thai Coast (Hi-Z) NGAY KHI BOOT */
+    drive_service_lock_motors();
+
+    /* Xac nhan ban firmware hop le neu vua cap nhat qua OTA */
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
@@ -827,182 +347,97 @@ void app_start(void)
         esp_ota_mark_app_valid_cancel_rollback();
     }
 
-    ESP_ERROR_CHECK(wifi_ap_init_base());
-    ota_boot_window();
+    ESP_LOGW("BOOT", "========================================");
+    ESP_LOGW("BOOT", "LineRobot ESP32 Boot (reset reason=%d)", (int)esp_reset_reason());
+    ESP_LOGW("BOOT", "========================================");
 
-    /* Chạy network_task + hil_control_step đồng bộ 1:1 ở ưu tiên cao */
-    xTaskCreatePinnedToCore(
-        network_task, "HIL_Lockstep", 8192, NULL,
-        configMAX_PRIORITIES - 2, NULL, 1);
-
-    ESP_LOGI(TAG, "Lockstep HIL started");
-=======
-static void system_services_init(void)
-{
-    /* 0. AN TOAN PHAN CUNG: Khoa cau H o trang thai Coast (Hi-Z) NGAY KHI BOOT
-     *    de dam bao dong co khong giat/quay trong suot cua so OTA. */
-    drive_service_lock_motors();
-
-    esp_reset_reason_t reason = esp_reset_reason();
-
-    ESP_LOGW("BOOT", "================================");
-    ESP_LOGW("BOOT", "ESP32 RESTART DETECTED");
-    ESP_LOGW("BOOT", "Reset reason: %d", reason);
-    ESP_LOGW("BOOT", "================================");
-  
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("esp_netif_lwip", ESP_LOG_WARN);
 
     usr_led_init();
+    ESP_ERROR_CHECK(wifi_ap_init_base());
 
-    /* 1. Initialize NVS, esp_netif, and default event loop FIRST */
-    wifi_ap_init_base();
-
-    /* 2. Now LwIP's tcpip mbox exists—safe to initialize UDP telemetry */
-    telemetry_init();
-  
-    ESP_LOGI(TAG, "System telemetry ready");
-
-    /* Stage 1: OTA Boot Window (press BOOT to skip) */
-    ESP_LOGI(TAG, "Starting up");
-
-    /* 2. Open OTA window (turns on LineRobot-OTA; boot logs broadcast here!) */
+    /* 1. Cua so OTA (15s, nhan BOOT de bo qua ngay; giu SoftAP bat sau OTA) */
     ota_boot_window();
+
+    /* 2. Khoi dong vong trong 200 Hz doc quyen tren Core 1 */
+    ESP_ERROR_CHECK(drive_service_start());
+
+    /* 3. Khoi dong cam bien do line (profile 5S tuong thich Wi-Fi, tu nap calib 7S tu NVS) */
+    if (sensor_service_init(TCRT_PROFILE_5S) != ESP_OK) {
+        ESP_LOGE(TAG, "Line sensor init failed!");
+    }
+
+    /* 4. Khoi dong & Tare Loadcell HX711 (nhay LED1 2 s) */
+    if (loadcell_service_init() == ESP_OK) {
+        ESP_LOGI(TAG, "Taring HX711 in 2 s - keep load cell EMPTY");
+        usr_led_start_blink(250);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_err_t err = loadcell_service_tare();
+        usr_led_set(false);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "HX711 Tare OK (offset = %ld, scale = %.1f)",
+                     (long)loadcell_service_get_offset(), HX711_CALIBRATION_FACTOR);
+        } else {
+            ESP_LOGW(TAG, "HX711 Tare failed (%s) -> disabling loadcell", esp_err_to_name(err));
+            loadcell_service_deinit();
+        }
+    } else {
+        ESP_LOGW(TAG, "HX711 init failed - continuing without loadcell");
+    }
+
+    /* 5. Khoi dong module vong ngoai & ken UDP MATLAB */
+    mission_ctrl_init();
+    matlab_link_set_app_state(APP_STATE_IDLE);
+    ESP_ERROR_CHECK(matlab_link_start());
 }
-
-static esp_err_t sensors_start(void)
-{
-    /* Stage 2: Line Sensor Init & Interactive Sweep Calibration */
-    esp_err_t err = sensor_service_init();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Running without line sensor service (%s)", esp_err_to_name(err));
-    }
-    else {
-        sensor_service_calibrate_sweep();
-    }
-  
-    ESP_LOGI(TAG, "Taring in 2 s - keep the load cell EMPTY");
-    usr_led_start_blink(500);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    /* Stage 3: Load Cell (HX711) Init & Tare */
-    err = loadcell_service_tare();
-    usr_led_set(false);          /* Turn OFF once tare completes */
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Tare failed (%s) - check DOUT/SCK wiring and 3V3 power",
-                 esp_err_to_name(err));
-        loadcell_service_deinit();
-        return;
-    }
-
-    ESP_LOGI(TAG, "Tare done, offset = %ld", (long)loadcell_service_get_offset());
-    return ESP_OK;
-}
-
 
 void app_start(void)
 {
-    system_services_init();
-  
-    if (drive_start() != ESP_OK) {
-        return;
-    }
-  
-    sensors_start();
-  
-    /*
-     * Vong lap chinh (Core 0):
-     *   Hien tai doc Line Sensor, Loadcell & giam sat trang thai vong trong qua Telemetry.
-     *   Khi tich hop vong ngoai (7x TCRT5000 + Luenberger 100 Hz + SMC 20 Hz):
-     *     - Dang ky dong bo pha: drive_service_register_outer_notify(outer_task, OBSERVER_LOOP_DIVIDER);
-     *     - Doc odometry       : drive_service_get_state(&drv); -> drv.v_mps, drv.w_rads, drv.s_m
-     *     - Tai tram tai hang  : dung xe bang drive_service_stop_brake(), doi drive_service_is_stopped(),
-     *                            doc HX711 (sau khi hieu chuan LOADCELL_SCALE trong config.h) va goi:
-     *                            drive_service_set_payload_kg(r.grams * 0.001f);
-     *                            drive_service_reset_odometry();
-     *     - Khoi hanh muot     : drive_service_start_scurve(ROBOT_V_NOM_MPS, ROBOT_SCURVE_DEFAULT_T_S);
-     *     - Bam line SMC       : drive_service_set_chassis_vel(v_cmd, w_cmd);
-     */
+    system_init();
 
-    usr_led_start_run_pattern();
+    boot_btn_fsm_t btn;
+    boot_btn_init(&btn);
 
-    uint8_t loadcell_div = 0;
+    ESP_LOGI(TAG, "==============================================================");
+    ESP_LOGI(TAG, "READY (IDLE) | Wi-Fi AP: '%s' (192.168.4.1:%d) | Calib NVS: %s",
+             ROBOT_WIFI_SSID, MATLAB_CMD_PORT,
+             sensor_service_has_valid_calib() ? "VALID" : "DEFAULT (hold BOOT 2s!)");
+    ESP_LOGI(TAG, "  * MATLAB Wi-Fi : Send START_A (5S Live) or START_B (7S Burst)");
+    ESP_LOGI(TAG, "  * BOOT 1 click : Standalone 7-sensor run (no log)");
+    ESP_LOGI(TAG, "  * BOOT 2 clicks: Standalone 5-sensor run (no log)");
+    ESP_LOGI(TAG, "  * BOOT hold 2s : 7-sensor calibration -> save NVS");
+    ESP_LOGI(TAG, "==============================================================");
 
     while (1) {
-        line_sensor_reading_t line = {0};
-        bool line_ok = false;
-
-        /* 1. Line Sensor Log (every 200 ms) */
-        if (sensor_service_is_enabled()) {
-            if (sensor_service_read(&line) == ESP_OK) {
-                line_ok = true;
-                /* Build quick 6/7-char visual bar: '#' >= 50%, '+' >= 15%, '.' < 15% */
-                char bar[TCRT5000_ACTIVE_CHANNELS + 1] = {0};
-                for (int i = 0; i < line.active_count; i++) {
-                    if (line.norm[i] >= 50.0f)      bar[i] = '#';
-                    else if (line.norm[i] >= 15.0f) bar[i] = '+';
-                    else                            bar[i] = '.';
-                }
-#if USE_TELEMETRY
-            ESP_LOGI(TAG, "LINE (S2-S6) [%s] | %3.0f %3.0f %3.0f %3.0f %3.0f | err=%+6.2f mm | %s",
-                 bar,
-                 line.norm[0], line.norm[1], line.norm[2],
-                 line.norm[3], line.norm[4],
-                 line.position_mm,
-                 line.line_detected ? "OK" : "LOST");
-#else
-            ESP_LOGI(TAG, "LINE (S1-S7) [%s] | %3.0f %3.0f %3.0f %3.0f %3.0f %3.0f %3.0f | err=%+6.2f mm | %s",
-                 bar,
-                 line.norm[0], line.norm[1], line.norm[2],
-                 line.norm[3], line.norm[4], line.norm[5], line.norm[6],
-                 line.position_mm,
-                 line.line_detected ? "OK" : "LOST");
-#endif
-            } else {
-                ESP_LOGW(TAG, "Line sensor read failed");
-            }
-        }      
-        /* 2. Inner Drive Loop State Log (every 200 ms) */
-        drive_state_t drv;
-        drive_service_get_state(&drv);
-        ESP_LOGI(TAG,
-                 "DRV mode=%d v=%.3f m/s w=%.2f rad/s s=%.3f m | vA=%.3f vB=%.3f | jitter=%u us",
-                 (int)drv.mode, drv.v_mps, drv.w_rads, drv.s_m,
-                 drv.v_a_mps, drv.v_b_mps, (unsigned)drv.dt_us_err);
-      
-        /* 3. Load Cell Log (once every 10 cycles = every 2.0 s) */
-        if (loadcell_div++ % 10 == 0) {
-          if (!loadcell_service_is_enabled()) {
-              ESP_LOGE(TAG, "WEIGHT     | DISABLED (loadcell_service_is_enabled() == false)");
-            } else {
-                loadcell_reading_t r;
-                esp_err_t lc_err = loadcell_service_read(&r);
-                if (lc_err == ESP_OK) {
-                    ESP_LOGI(TAG, "WEIGHT     | raw=%8ld | net=%8ld | %7.2f g",
-                             (long)r.raw, (long)r.net, r.grams);
-                } else {
-                    ESP_LOGE(TAG, "WEIGHT     | READ FAILED (%s)", esp_err_to_name(lc_err));
-                }
-            }
-            
-            if (line_ok) {
-                /* Inside the every-10-cycles block in app.c: */
-                int amb_min_all = 4095, amb_max_all = 0;
-                float amb_avg_all = 0.0f;
-                for (int i = 0; i < line.active_count; i++) {
-                    if (line.amb.min[i] < amb_min_all) amb_min_all = line.amb.min[i];
-                    if (line.amb.max[i] > amb_max_all) amb_max_all = line.amb.max[i];
-                    amb_avg_all += line.amb.avg[i];
-                }
-                amb_avg_all /= (float)line.active_count;
-                ESP_LOGI(TAG, "AMBIENT    | min=%4d | max=%4d | avg=%6.1f (ch avg=[%.0f %.0f %.0f %.0f %.0f])",
-                    amb_min_all, amb_max_all, amb_avg_all,
-                    line.amb.avg[0], line.amb.avg[1], line.amb.avg[2],
-                    line.amb.avg[3], line.amb.avg[4]);
-            }
+        /* 1. Kiem tra lenh tu MATLAB qua Wi-Fi */
+        matlab_action_t act = matlab_link_take_action();
+        if (act == MATLAB_ACT_START_A) {
+            run_system_a();
+            boot_btn_init(&btn);
+            continue;
+        } else if (act == MATLAB_ACT_START_B) {
+            run_system_b();
+            boot_btn_init(&btn);
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        /* 2. Kiem tra nut BOOT (Che do 2 doc lap & Hieu chuan 7 mat) */
+        btn_event_t evt = boot_btn_poll(&btn);
+        if (evt == BTN_EVT_SINGLE_CLICK) {
+            run_standalone(TCRT_PROFILE_7S);
+            boot_btn_init(&btn);
+            continue;
+        } else if (evt == BTN_EVT_DOUBLE_CLICK) {
+            run_standalone(TCRT_PROFILE_5S);
+            boot_btn_init(&btn);
+            continue;
+        } else if (evt == BTN_EVT_LONG_HOLD) {
+            run_calibration_workflow();
+            boot_btn_init(&btn);
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
->>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
 }
