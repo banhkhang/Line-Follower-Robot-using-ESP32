@@ -2,10 +2,13 @@
 #include "driver/gpio.h"
 
 /*
- * config.h - the ONE place for pins and tunable numbers.
+ * config.h - the ONE place for pins, peripheral settings, and wireless config.
  *
  * If you change a wire on the PCB, change it here and nowhere else.
  * Pin names follow the schematic (ESP32-WROOM custom board).
+ *
+ * Note: Kinematic, dynamic, motor plant, and 2-DOF PI gain-scheduling constants
+ * live in `robot_params.h` to keep hardware pinout cleanly separated from math.
  */
 
 /* ------------------------------------------------------------------ */
@@ -39,17 +42,27 @@
 
 #define LINE_SENSOR_MAX_COUNT  7
 /* ------------------------------------------------------------------ */
-/* Motor driver (2 channels, 2 PWM inputs each) and encoders           */
+/* Motor driver (DRV8871 + 6N137 optocouplers) & Hall encoders        */
 /* ------------------------------------------------------------------ */
-#define PIN_MOTOR_A1     12   /* PWMA1 - strapping pin, must be LOW at boot */
-#define PIN_MOTOR_A2     13   /* PWMA2 */
-#define PIN_MOTOR_B1     16   /* PWMB1 */
-#define PIN_MOTOR_B2     15   /* PWMB2 - strapping pin */
+#define PIN_MOTOR_A1     12   /* PWMA1 (Motor A / LEFT) - strapping pin, must be LOW at boot */
+#define PIN_MOTOR_A2     13   /* PWMA2 (Motor A / LEFT) */
+#define PIN_MOTOR_B1     16   /* PWMB1 (Motor B / RIGHT) */
+#define PIN_MOTOR_B2     15   /* PWMB2 (Motor B / RIGHT) - strapping pin */
 
-#define PIN_ENC_A_A      21   /* ENCA-A */
-#define PIN_ENC_A_B      19   /* ENCA-B */
-#define PIN_ENC_B_A      18   /* ENCB-A */
-#define PIN_ENC_B_B      17   /* ENCB-B */
+/* LEDC PWM: 10 kHz, 12-bit (4096 levels -> ~0.30 mm/s quantization step) */
+#define MOTOR_PWM_FREQ_HZ   10000
+#define MOTOR_PWM_RES_BITS  12
+#define MOTOR_PWM_MAX_DUTY  ((1U << MOTOR_PWM_RES_BITS) - 1U)
+
+/* Hall encoders (M/T 1x mode on Core 1; channel B pins MUST be < 32 for GPIO_IN_REG) */
+#define PIN_ENC_A_A      21   /* ENCA-A (Motor A / LEFT, rising-edge ISR) */
+#define PIN_ENC_A_B      19   /* ENCA-B (Motor A / LEFT, direction logic) */
+#define PIN_ENC_B_A      18   /* ENCB-A (Motor B / RIGHT, rising-edge ISR) */
+#define PIN_ENC_B_B      17   /* ENCB-B (Motor B / RIGHT, direction logic) */
+
+/* Invert Motor A encoder sign so both wheels read positive when driving forward */
+#define ENC_DIR_A        (-1)
+#define ENC_DIR_B        (+1)
 
 /* ------------------------------------------------------------------ */
 /* User I/O                                                            */
@@ -57,9 +70,9 @@
 #define PIN_USER_LED      2   /* USR_LED (strapping pin) */
 //#define PIN_USER_BUTTON   4   /* USR_BTN, external pull-up, pressed = LOW */
 
-/* ---------------- OTA (wireless update) ---------------- */
+/* ---------------- OTA (wireless update - stable main config) ---------------- */
 #define PIN_BOOT_BUTTON   0        /* BOOT button, pressed = LOW (press it AFTER reset, not during) */
-#define OTA_WINDOW_MS     100000    /* how long to wait for an upload after reset */
+#define OTA_WINDOW_MS     100000   /* how long to wait for an upload after reset */
 #define OTA_WIFI_SSID     "LineRobot-OTA"
 #define OTA_WIFI_PASS     "12345678"   /* at least 8 characters */
 
