@@ -5,11 +5,15 @@ idf_component_register(
         "../components/application/app.c"
 
         "../components/service/loadcell_service.c"
+        "../components/service/vel_ctrl.c"
+        "../components/service/drive_service.c"
+
         "../components/driver/hx711.c"
+        "../components/driver/motor.c"
+        "../components/driver/encoder.c"
         "../components/driver/telemetry.c"
         "../components/driver/wifi_ap.c"
-        # "../components/driver/motor.c"   # uncomment once motor.c is ready
-        
+
     INCLUDE_DIRS
         "."
         "../boot"
@@ -20,6 +24,9 @@ idf_component_register(
 
     REQUIRES
         esp_driver_gpio
+        esp_driver_ledc
+        esp_driver_gptimer
+        esp_timer
         esp_wifi
         esp_netif
         esp_event
