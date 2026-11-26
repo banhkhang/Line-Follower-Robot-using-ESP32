@@ -3,6 +3,8 @@
 #include "ota.h"
 #include "wifi_ap.h"
 #include "config.h"
+#include "usr_led.h"
+
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_http_server.h"
@@ -99,6 +101,13 @@ static esp_err_t update_handler(httpd_req_t *req)
 
 void ota_boot_window(void)
 {
+<<<<<<< HEAD
+=======
+    // =========================================================
+    // 1. GPIO CONFIGURATION
+    // =========================================================
+    gpio_reset_pin(PIN_BOOT_BUTTON);
+>>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BOOT_BUTTON,
         .mode         = GPIO_MODE_INPUT,
@@ -106,8 +115,16 @@ void ota_boot_window(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
+
+<<<<<<< HEAD
+=======
     gpio_config(&btn);
 
+    // =========================================================
+    // 2. START WIFI ACCESS POINT
+    // =========================================================
+
+>>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
     if (wifi_ap_on(OTA_WIFI_SSID, OTA_WIFI_PASS) != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi AP failed to start, skipping OTA window");
         return;
@@ -158,6 +175,12 @@ void ota_boot_window(void)
             break;
         }
 
+<<<<<<< HEAD
+=======
+        // LED heartbeat: blink every 1000 ms.
+        usr_led_blink_poll(1000);
+
+>>>>>>> b3bd95d5874f98f3172a4e590f05b1fae8eedb51
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 

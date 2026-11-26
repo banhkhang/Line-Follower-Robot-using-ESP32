@@ -137,3 +137,8 @@ Tips:
 - Every function has a short comment saying what it does.
 - Pins and magic numbers only in `config.h`.
 - Print with `ESP_LOGI(TAG, ...)`, not `printf`.
+
+Self note:
+To open UDP socket via MobaXterm:
+- Ctrl + Alt + T
+- python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1); s.bind(('0.0.0.0',5000)); [print(s.recv(2048).decode(errors='replace'),end='',flush=True) for _ in iter(int,1)]"
