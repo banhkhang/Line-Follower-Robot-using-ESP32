@@ -351,7 +351,7 @@ esp_err_t sensor_service_read(line_sensor_reading_t *out_reading)
         }
 #endif
 
-        out_reading->position_mm = -weighted_sum / total_weight;
+        out_reading->position_mm = pos;//-weighted_sum / total_weight;
         s_last_position_mm = out_reading->position_mm;
     } else {
         out_reading->line_detected = false;

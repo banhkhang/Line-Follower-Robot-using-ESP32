@@ -66,7 +66,7 @@
 #define OTA_WIFI_PASS     "12345678"   /* at least 8 characters */
 
 /* ---------------- Telemetry (wireless log) ---------------- */
-#define USE_TELEMETRY         0             /* 0 = no Wi-Fi at all while the robot runs */
+#define USE_TELEMETRY         1             /* 0 = no Wi-Fi at all while the robot runs */
 #define TELEMETRY_WIFI_SSID   "LineRobot-LOG"
 #define TELEMETRY_WIFI_PASS   "12345678"
 #define TELEMETRY_PORT        5000
