@@ -74,6 +74,7 @@ typedef struct {
     float t_since_update_s; /* Thoi gian troi qua ke tu lan cap nhat SMC gan nhat [s] */
     float settle_dwell_s;   /* Thoi gian 2 banh da o trong dai xac lap lien tuc [s] */
     float last_dt_smc_s;    /* Chu ky thuc te cua lan cap nhat SMC gan nhat [s] */
+    float last_e2_m;        /* Sai so e2 tai lan phat lenh SMC gan nhat (phat hien cat qua 0) */
 } outer_smc_t;
 
 /* Nap bo tham so mac dinh chuan tu robot_params.h */
@@ -107,6 +108,7 @@ bool  outer_smc_step_adaptive(outer_smc_t *smc,
                               float vb_ref_mps,
                               float vb_act_mps,
                               bool active_tracking,
+                              bool line_ok,
                               float dt_tick_s);
 
 /*

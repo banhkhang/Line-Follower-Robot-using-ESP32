@@ -329,19 +329,48 @@ esp_err_t sensor_service_read(line_sensor_reading_t *out_reading)
             n_active++;
         }
 
-        /* Apply floor noise deadzone for centroid output */
+        /* Apply floor noise deadzone for telemetry display */
         if (s_pct < NORM_NOISE_DEADZONE) {
             s_pct = 0.0f;
         }
         out_reading->norm[i] = s_pct;
-        weighted_sum += s_pct * s_phys_pos_mm[i];
-        total_weight += s_pct;
     }
 
     out_reading->total_i  = total_i;
     out_reading->n_active = n_active;
 
-    if (total_i >= OUTER_LINE_TOTAL_I_MIN && total_weight >= LINE_DETECT_SUM_MIN) {
+    /*
+     * Tinh trong tam line (e2) bang I_eff (da tru nen quang hoc 12% & cat < 18% nhu
+     * SMC_controller14.m) KET HOP cua so không gian quanh mat cuc dai (|y_k - y_peak| <= 20 mm):
+     *  - Loai bo hoan toan nhieu nen trang o 2 mat ngoai cung S1/S7 (+-27 mm) trong He B (7S)
+     *    va che do doc lap 7S (khong bi canh tay don 27 mm keo lech trong tam khi line o giua).
+     *  - Khi line thuc su lech ra mep S1/S2 hoac S6/S7, mat cuc dai dich ra mep -> S1/S7 van
+     *    tham gia binh thuong de giu tam nhin rong 7 mat!
+     */
+    int   peak_idx = -1;
+    float peak_val = 0.0f;
+    for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
+        if (out_reading->i_eff[i] > peak_val) {
+            peak_val = out_reading->i_eff[i];
+            peak_idx = i;
+        }
+    }
+
+    if (peak_idx >= 0) {
+        float y_peak = s_phys_pos_mm[peak_idx];
+        for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
+            float w = out_reading->i_eff[i];
+            if (w <= 0.0f) continue;
+            float dy = s_phys_pos_mm[i] - y_peak;
+            if (dy < 0.0f) dy = -dy;
+            if (dy <= 20.0f) {
+                weighted_sum += w * s_phys_pos_mm[i];
+                total_weight += w;
+            }
+        }
+    }
+
+    if (total_i >= OUTER_LINE_TOTAL_I_MIN && total_weight >= OUTER_LINE_TOTAL_I_MIN) {
         out_reading->line_detected = true;
 
         float pos = weighted_sum / total_weight;

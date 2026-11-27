@@ -275,6 +275,7 @@ function [samples, final_st] = run_live_capture_A(u, ip, port, CMD_STOP, PKT_LIV
     max_prealloc = 5000;
     raw_buf      = zeros(52, max_prealloc, 'uint8');
     n_rx         = 0;
+    last_t_ms    = -1;
     final_st     = struct();
 
     fig = figure('Name', 'He A - Live Telemetry (Dong cua so nay de DUNG KHAN CAP)', ...
@@ -298,10 +299,15 @@ function [samples, final_st] = run_live_capture_A(u, ip, port, CMD_STOP, PKT_LIV
                 if ~v, continue; end
                 if ptype == PKT_LIVE_SAMPLE && numel(pl) == 52
                     t_last = tic;
+                    t_ms_cur = double(typecast(pl(1:4), 'uint32'));
+                    if t_ms_cur <= last_t_ms
+                        continue; % Bo qua goi bi Wi-Fi MAC truyen lap
+                    end
+                    last_t_ms = t_ms_cur;
                     if n_rx < max_prealloc
                         n_rx = n_rx + 1;
                         raw_buf(:, n_rx) = pl(:);
-                        t_s   = double(typecast(pl(1:4), 'uint32')) * 1e-3;
+                        t_s   = t_ms_cur * 1e-3;
                         e2_mm = double(typecast(pl(7:8), 'int16')) * 0.01;
                         va    = double(typecast(pl(27:28), 'int16')) * 1e-3;
                         vb    = double(typecast(pl(31:32), 'int16')) * 1e-3;
@@ -484,9 +490,9 @@ function pl = encode_params(p)
 end
 
 function p = default_params()
-    p.v_req = 0.50; p.beta_smc = 0.016; p.k_smc = 0.30; p.phi_bl = 0.015;
-    p.ki_smc = 1.70; p.z_max = 0.015; p.w_max = 4.50;
-    p.ts_min_s = 0.050; p.ts_max_s = 0.160; p.settle_margin_s = 0.020; p.settle_band_mps = 0.020;
+    p.v_req = 0.50; p.beta_smc = 0.025; p.k_smc = 0.19; p.phi_bl = 0.018;
+    p.ki_smc = 0.95; p.z_max = 0.008; p.w_max = 2.60;
+    p.ts_min_s = 0.055; p.ts_max_s = 0.090; p.settle_margin_s = 0.010; p.settle_band_mps = 0.035;
     p.station_trim_m = 0.0; p.goal_trim_m = 0.0;
 end
 
@@ -522,8 +528,28 @@ end
 
 function save_and_plot_run(prefix, S, st)
     stamp = datestr(now, 'yyyymmdd_HHMMSS');
-    mat_file = sprintf('%s_%s.mat', prefix, stamp);
-    csv_file = sprintf('%s_%s.csv', prefix, stamp);
+    prefix_chr = char(prefix);
+
+    % Tach prefix ("SystemA_5S" -> "SystemA" va "5S") de tao thu muc co so thu tu tang dan:
+    % vi du: SystemA_1_5S_20261127_182807, SystemA_2_5S_..., SystemB_1_7S_...
+    tok = regexp(prefix_chr, '^([^_]+)_(.+)$', 'tokens', 'once');
+    if ~isempty(tok)
+        sys_part  = tok{1};
+        sens_part = tok{2};
+    else
+        sys_part  = prefix_chr;
+        sens_part = 'RUN';
+    end
+
+    run_idx = next_run_index(pwd, sys_part);
+    out_dir = fullfile(pwd, sprintf('%s_%d_%s_%s', sys_part, run_idx, sens_part, stamp));
+    if ~exist(out_dir, 'dir')
+        mkdir(out_dir);
+    end
+
+    % Ten file du lieu ben trong thu muc giu nguyen nhu hien gio
+    mat_file = fullfile(out_dir, sprintf('%s_%s.mat', prefix_chr, stamp));
+    csv_file = fullfile(out_dir, sprintf('%s_%s.csv', prefix_chr, stamp));
     save(mat_file, 'S', 'st');
 
     T = table(S.t_s, S.e2_raw_mm, S.e2_filt_mm, S.e3_hat_deg, S.c_hat_radm, ...
@@ -538,10 +564,9 @@ function save_and_plot_run(prefix, S, st)
               's_enc_m','total_i','jitter_us','state','dt_smc_ms','load_kg', ...
               'S1','S2','S3','S4','S5','S6','S7'});
     writetable(T, csv_file);
-    fprintf('[SAVED] %s & %s (%d samples)\n', mat_file, csv_file, S.N);
 
     % --- Figure 1: Sai so bam line e2 ---
-    figure('Name', [char(prefix) ' - Sai so bam line e2'], 'Color', 'w', 'Position', [60, 480, 740, 380]);
+    f1 = figure('Name', [prefix_chr ' - Sai so bam line e2'], 'Color', 'w', 'Position', [60, 480, 740, 380]);
     hold on; grid on;
     plot(S.t_s, S.e2_raw_mm, 'Color', [0.75 0.75 0.75], 'LineWidth', 0.9);
     plot(S.t_s, S.e2_filt_mm, 'b-', 'LineWidth', 1.6);
@@ -551,9 +576,10 @@ function save_and_plot_run(prefix, S, st)
     xlabel('Thoi gian (s)'); ylabel('e_2 (mm)'); ylim([-20 20]);
     title('Sai so lech ngang e_2 (SMC frame: + = Trai)');
     legend('e_{2,raw}', 'e_{2,filt} (Alpha-Beta)', 'Co tach nhanh Y', '\pm3 mm', '\pm16 mm', 'Location', 'best');
+    export_fig_png_svg(f1, fullfile(out_dir, [prefix_chr ' - Sai so bam line e2']));
 
     % --- Figure 2: Luenberger Observer & Mat truot SMC ---
-    figure('Name', [char(prefix) ' - Observer & Sliding Surface'], 'Color', 'w', 'Position', [820, 480, 720, 420]);
+    f2 = figure('Name', [prefix_chr ' - Observer & Sliding Surface'], 'Color', 'w', 'Position', [820, 480, 720, 420]);
     subplot(2,1,1);
     yyaxis left; plot(S.t_s, S.e3_hat_deg, 'b-', 'LineWidth', 1.4); ylabel('e_{3,hat} (deg)'); grid on;
     yyaxis right; plot(S.t_s, S.c_hat_radm, 'r--', 'LineWidth', 1.2); ylabel('c_{hat} (rad/m)');
@@ -563,9 +589,10 @@ function save_and_plot_run(prefix, S, st)
     plot(S.t_s, S.z_int_mm, 'm--', 'LineWidth', 1.3);
     xlabel('Thoi gian (s)'); ylabel('mm'); legend('\sigma (mm)', 'z_{int} (mm)', 'Location', 'best');
     title('Mat truot \sigma va thanh phan tich phan z_{int}');
+    export_fig_png_svg(f2, fullfile(out_dir, [prefix_chr ' - Observer & Sliding Surface']));
 
     % --- Figure 3: Vong trong (2 banh & PWM) ---
-    figure('Name', [char(prefix) ' - Inner Loop Tracking'], 'Color', 'w', 'Position', [60, 40, 740, 420]);
+    f3 = figure('Name', [prefix_chr ' - Inner Loop Tracking'], 'Color', 'w', 'Position', [60, 40, 740, 420]);
     subplot(2,1,1);
     plot(S.t_s, S.va_ref_mps, 'b--', S.t_s, S.va_act_mps, 'b-', ...
          S.t_s, S.vb_ref_mps, 'r--', S.t_s, S.vb_act_mps, 'r-', 'LineWidth', 1.3);
@@ -574,9 +601,10 @@ function save_and_plot_run(prefix, S, st)
     subplot(2,1,2);
     plot(S.t_s, S.pwm_a_pct, 'b-', S.t_s, S.pwm_b_pct, 'r-', 'LineWidth', 1.3);
     grid on; xlabel('Thoi gian (s)'); ylabel('PWM (%)'); legend('PWM A','PWM B');
+    export_fig_png_svg(f3, fullfile(out_dir, [prefix_chr ' - Inner Loop Tracking']));
 
     % --- Figure 4: Chu ky SMC thich nghi & Van toc than xe ---
-    figure('Name', [char(prefix) ' - Adaptive SMC & Odometry'], 'Color', 'w', 'Position', [820, 40, 720, 420]);
+    f4 = figure('Name', [prefix_chr ' - Adaptive SMC & Odometry'], 'Color', 'w', 'Position', [820, 40, 720, 420]);
     subplot(2,1,1);
     stairs(S.t_s, S.dt_smc_ms, 'k-', 'LineWidth', 1.4); hold on; grid on;
     yline(50, 'b--'); yline(200, 'r--');
@@ -586,9 +614,10 @@ function save_and_plot_run(prefix, S, st)
     yyaxis left; plot(S.t_s, S.v_cmd_mps, 'k--', S.t_s, S.v_act_mps, 'b-', 'LineWidth', 1.3); ylabel('v (m/s)'); grid on;
     yyaxis right; plot(S.t_s, S.w_cmd_rads, 'm:', S.t_s, S.w_act_rads, 'r-', 'LineWidth', 1.2); ylabel('\omega (rad/s)');
     xlabel('Thoi gian (s)'); legend('v_{cmd}','v_{act}','w_{cmd}','w_{act}','Location','best');
+    export_fig_png_svg(f4, fullfile(out_dir, [prefix_chr ' - Adaptive SMC & Odometry']));
 
     % --- Figure 5: Ban do 7 mat TCRT5000 & total_I ---
-    figure('Name', [char(prefix) ' - 7-Sensor Array Heatmap'], 'Color', 'w', 'Position', [440, 220, 760, 400]);
+    f5 = figure('Name', [prefix_chr ' - 7-Sensor Array Heatmap'], 'Color', 'w', 'Position', [440, 220, 760, 400]);
     subplot(2,1,1);
     imagesc(S.t_s, 1:7, S.norm_s'); colormap(flipud(gray)); colorbar;
     yticks(1:7); yticklabels({'S1(-27)','S2(-18)','S3(-9)','S4(0)','S5(+9)','S6(+18)','S7(+27)'});
@@ -598,4 +627,47 @@ function save_and_plot_run(prefix, S, st)
     plot(S.t_s, S.mission_state * 0.5, 'r--', 'LineWidth', 1.1);
     xlabel('Thoi gian (s)'); ylabel('total_I / 0.5*State');
     legend('total\_I', '0.5 \times Mission State', 'Location', 'best');
+    export_fig_png_svg(f5, fullfile(out_dir, [prefix_chr ' - 7-Sensor Array Heatmap']));
+
+    fprintf('[SAVED] Thu muc: %s\n', out_dir);
+    fprintf('        Du lieu: .mat, .csv (%d samples) + 5 do thi (.png & .svg)\n', S.N);
+end
+
+function idx = next_run_index(base_dir, sys_part)
+    % Tim so thu tu lon nhat cua cac thu muc dang "<sys_part>_<N>_*" trong base_dir
+    d = dir(base_dir);
+    max_n = 0;
+    pat = ['^' regexptranslate('escape', sys_part) '_(\d+)_'];
+    for k = 1:numel(d)
+        if d(k).isdir
+            m = regexp(d(k).name, pat, 'tokens', 'once');
+            if ~isempty(m)
+                n = str2double(m{1});
+                if ~isnan(n) && n > max_n
+                    max_n = n;
+                end
+            end
+        end
+    end
+    idx = max_n + 1;
+end
+
+function export_fig_png_svg(fig_handle, base_path)
+    drawnow;
+    png_path = [base_path '.png'];
+    svg_path = [base_path '.svg'];
+    try
+        exportgraphics(fig_handle, png_path, 'Resolution', 300);
+    catch
+        print(fig_handle, png_path, '-dpng', '-r300');
+    end
+    try
+        print(fig_handle, svg_path, '-dsvg', '-vector');
+    catch
+        try
+            print(fig_handle, svg_path, '-dsvg');
+        catch
+            saveas(fig_handle, svg_path);
+        end
+    end
 end

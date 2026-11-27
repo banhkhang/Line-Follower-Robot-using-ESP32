@@ -100,9 +100,9 @@ void outer_estimator_step_200hz(outer_estimator_t *est, float e2_raw_m,
             est->de2_filt = est->de2_filt + (est->beta_sens / ts_sens_s) * res;
             est->last_e2_raw = e2_raw_m;
         } else {
-            /* Mat line tam thoi: giu du doan co suy giam van toc ngang de tranh troi xa */
-            est->e2_filt   = clampf(e2_pred, -0.035f, 0.035f);
-            est->de2_filt *= 0.90f;
+            /* Mat line tam thoi: giu du doan co suy giam nhanh van toc ngang de tranh troi xa */
+            est->e2_filt   = clampf(e2_pred, -0.025f, 0.025f);
+            est->de2_filt *= 0.70f;
         }
     } else {
         /*
@@ -236,10 +236,12 @@ void outer_estimator_step_y_branch_100hz(outer_estimator_t *est,
             e += step_e;
         }
 
-        /* Tron muot giua centroid va Gauss-Newton de tranh buoc nhay dot ngot */
+        /* Tron muot giua centroid va Gauss-Newton va kep theo be rong vat ly cua day cam bien
+         * (5S span +-18 mm -> kep +-16 mm de tranh day e_lat ra -22..-27 mm khi ca 5 mat den 100%) */
+        float gn_max_abs  = (profile == TCRT_PROFILE_7S) ? 0.026f : 0.016f;
         float alpha_blend = clampf((tot_g - single_line_tot) / OUTER_GN_BLEND_SPAN, 0.0f, 1.0f);
         e_lat = (1.0f - alpha_blend) * e_cent + alpha_blend * e;
-        e_lat = clampf(e_lat, -0.030f, 0.030f);
+        e_lat = clampf(e_lat, -gn_max_abs, gn_max_abs);
     }
 
     /* Buoc 3: Cap nhat bo loc Alpha-Beta theo nhip 100 Hz */
@@ -254,6 +256,7 @@ void outer_estimator_step_observer_100hz(outer_estimator_t *est,
                                          float w_act_rads,
                                          float v_cmd_mps,
                                          bool active_tracking,
+                                         bool line_ok,
                                          float ts_in_s)
 {
     if (est == NULL) return;
@@ -266,15 +269,24 @@ void outer_estimator_step_observer_100hz(outer_estimator_t *est,
         return;
     }
 
+    /* Khi mat line: khong cap nhat doi chieu de tranh e3_hat & c_hat bao hoa phi vat ly */
+    if (!line_ok) {
+        est->c_hat  *= 0.92f;
+        est->e3_hat *= 0.95f;
+        est->e2_hat  = est->e2_filt;
+        return;
+    }
+
     float v_denom = fmaxf(fabsf(v_obs), OUTER_OBS_V_MIN_DENOM);
 
     /*
      * 1. Uoc luong do cong quy dao c_hat = w_act / v_denom qua bo loc thong thap bac 1
-     *    (tau_c = 35 ms): giup SMC tinh thanh phan bu truyen thang do cong u_eq.
+     *    (tau_c = 35 ms), kep trong gioi han vat ly |c_hat| <= 3.0 rad/m (R >= 0.33 m).
      */
-    float c_raw   = w_act_rads / v_denom;
+    float c_raw   = clampf(w_act_rads / v_denom, -OUTER_OBS_C_MAX_RADM, OUTER_OBS_C_MAX_RADM);
     float alpha_c = ts_in_s / (OUTER_OBS_TAU_C_S + ts_in_s);
-    est->c_hat    = (1.0f - alpha_c) * est->c_hat + alpha_c * c_raw;
+    est->c_hat    = clampf((1.0f - alpha_c) * est->c_hat + alpha_c * c_raw,
+                           -OUTER_OBS_C_MAX_RADM, OUTER_OBS_C_MAX_RADM);
 
     /*
      * 2. Chon cap cuc Luenberger thich nghi theo sai lech du doan |err_obs|:

@@ -117,6 +117,7 @@ void outer_estimator_step_observer_100hz(outer_estimator_t *est,
                                          float w_act_rads,
                                          float v_cmd_mps,
                                          bool active_tracking,
+                                         bool line_ok,
                                          float ts_in_s);
 
 #ifdef __cplusplus

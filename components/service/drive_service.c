@@ -189,9 +189,9 @@ static void drive_rt_task(void *pvParameters)
         s_cmd.params_dirty = false;
         portEXIT_CRITICAL(&s_lock);
 
-        /* Dong hoc thuan vi sai & quang duong odometry (khong bi troi tich phan) */
+        /* Dong hoc thuan vi sai (Motor A = PHAI phia S7, Motor B = TRAI phia S1) */
         float v_act = 0.5f * (va_mps + vb_mps);
-        float w_act = (vb_mps - va_mps) / ROBOT_TRACK_WIDTH_M;
+        float w_act = (va_mps - vb_mps) / ROBOT_TRACK_WIDTH_M;
         float s_a   = (float)(cnt_a - odom_zero_a) * ENC_DIST_PER_PULSE_1X_M;
         float s_b   = (float)(cnt_b - odom_zero_b) * ENC_DIST_PER_PULSE_1X_M;
         float s_m   = 0.5f * (s_a + s_b);
@@ -250,13 +250,16 @@ static void drive_rt_task(void *pvParameters)
                 }
 
                 /*
-                 * Dong hoc nghich vi sai (Motor A = trai, Motor B = phai):
-                 *   v_A = v - (B/2)*w,   v_B = v + (B/2)*w
+                 * Dong hoc nghich vi sai (Motor A = PHAI phia S7, Motor B = TRAI phia S1):
+                 *   w > 0 (re TRAI / CCW) -> banh PHAI (A) nhanh hon, banh TRAI (B) cham hon:
+                 *     v_A (PHAI) = v + (B/2)*w,   v_B (TRAI) = v - (B/2)*w
+                 * Khi chay tien (v_eff > 0): kep banh trong >= 0 m/s de chong van quay tai cho.
                  */
-                va_ref = clampf(v_eff - ROBOT_HALF_TRACK_M * w_eff,
-                                -ROBOT_V_WHEEL_ABS_MAX_MPS, ROBOT_V_WHEEL_ABS_MAX_MPS);
-                vb_ref = clampf(v_eff + ROBOT_HALF_TRACK_M * w_eff,
-                                -ROBOT_V_WHEEL_ABS_MAX_MPS, ROBOT_V_WHEEL_ABS_MAX_MPS);
+                float v_lo = (v_eff > 0.0f) ? 0.0f : -ROBOT_V_WHEEL_ABS_MAX_MPS;
+                va_ref = clampf(v_eff + ROBOT_HALF_TRACK_M * w_eff,
+                                v_lo, ROBOT_V_WHEEL_ABS_MAX_MPS);
+                vb_ref = clampf(v_eff - ROBOT_HALF_TRACK_M * w_eff,
+                                v_lo, ROBOT_V_WHEEL_ABS_MAX_MPS);
 
                 pwm_a = vel_ctrl_step(&ctrl_a, va_ref, va_mps, INNER_LOOP_TS_S);
                 pwm_b = vel_ctrl_step(&ctrl_b, vb_ref, vb_mps, INNER_LOOP_TS_S);
@@ -271,7 +274,7 @@ static void drive_rt_task(void *pvParameters)
                 vb_ref = clampf(cmd.v_b_cmd_mps,
                                 -ROBOT_V_WHEEL_ABS_MAX_MPS, ROBOT_V_WHEEL_ABS_MAX_MPS);
                 v_eff  = 0.5f * (va_ref + vb_ref);
-                w_eff  = (vb_ref - va_ref) / ROBOT_TRACK_WIDTH_M;
+                w_eff  = (va_ref - vb_ref) / ROBOT_TRACK_WIDTH_M;
 
                 pwm_a = vel_ctrl_step(&ctrl_a, va_ref, va_mps, INNER_LOOP_TS_S);
                 pwm_b = vel_ctrl_step(&ctrl_b, vb_ref, vb_mps, INNER_LOOP_TS_S);

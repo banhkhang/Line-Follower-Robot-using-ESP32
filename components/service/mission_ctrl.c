@@ -304,9 +304,9 @@ static void outer_ctrl_task(void *pvParameters)
         outer_estimator_step_200hz(&est, line.e2_smc_m, line.line_detected,
                                    in_y_zone, SENSOR_LOOP_TS_S);
 
-        /* Phat hien vach cat ngang (Tram tai hang) o 200 Hz */
+        /* Phat hien vach cat ngang (Tram tai hang) o 200 Hz - chi mo cong khi gan moc 2.0 m */
         bool is_marker_now = false;
-        if (mstate == MISSION_TO_LOAD && drv.s_m >= 0.50f) {
+        if (mstate == MISSION_TO_LOAD && drv.s_m >= TRACK_MARKER_WIN_MIN_M) {
             is_marker_now = detect_crossbar(&line);
             if (is_marker_now) {
                 if (marker_hits == 0) {
@@ -435,6 +435,8 @@ static void outer_ctrl_task(void *pvParameters)
                 if (drv.s_m >= s_target_stop_m) {
                     drive_service_stop_brake();
                     outer_smc_reset_state(&smc);
+                    v_cmd_out        = 0.0f;
+                    smc_track_active = false;
                     station_stop_s_m = drv.s_m;
                     mstate           = MISSION_WAIT_LOAD;
                     state_timer_s    = 0.0f;
@@ -524,10 +526,13 @@ static void outer_ctrl_task(void *pvParameters)
 
             case MISSION_TO_GOAL: {
                 /*
-                 * Cam bien cham dau mut cuoi duong (X = 3000 mm) tai s_axle ~ 4.7091 - 0.055 = 4.6541 m.
-                 * Quy hoach giam toc truoc moc nay de cham mep cuoi line o toc do bo 0.10 m/s.
+                 * Cam bien cham dau mut cuoi duong (X = 3000 mm) tai s_axle ~ 4.654 m (1 kg)
+                 * va ~4.689 m (2 kg do nen lop nhe ~0.7%). Bu theo tai de thoi gian bo creep-speed
+                 * truoc EOL ngan gon nhu nhau o ca 1 kg & 2 kg ma van dung chinh xac +-1 mm.
                  */
-                float d_rem = (TRACK_LEG2_DIST_M - ROBOT_SENSOR_OFFSET_M) - drv.s_m;
+                float leg2_odom_ref = TRACK_LEG2_DIST_M
+                                    + ((load_class_kg == 2U) ? TRACK_LEG2_2KG_ODOM_COMP_M : 0.0f);
+                float d_rem = (leg2_odom_ref - ROBOT_SENSOR_OFFSET_M) - drv.s_m;
                 float v_prof = outer_calc_decel_velocity(d_rem, smc.p.v_req, ROBOT_V_MIN_MPS,
                                                          TRACK_DECEL_WINDOW_M, TRACK_DECEL_MARGIN_M);
                 float v_junc = outer_calc_y_junction_speed(drv.s_m, smc.p.v_req);
@@ -595,16 +600,21 @@ static void outer_ctrl_task(void *pvParameters)
                 break;
         }
 
-        /* 5. Cap nhat Bo quan sat Luenberger (100 Hz) & Bo lap lich SMC thich nghi */
+        /* 5. Cap nhat Bo quan sat Luenberger (100 Hz) & Bo lap lich SMC thich nghi.
+         *    Su dung van toc thuc sau S-curve (v_eff_ctrl) de SMC khong van lai manh luc khoi hanh! */
+        float v_eff_ctrl = drv.scurve_active ? fminf(v_cmd_out, drv.v_cmd_eff_mps) : v_cmd_out;
+
         outer_estimator_step_observer_100hz(&est, drv.v_mps, drv.w_rads,
-                                            v_cmd_out, smc_track_active, OBSERVER_LOOP_TS_S);
+                                            v_eff_ctrl, smc_track_active,
+                                            line.line_detected, OBSERVER_LOOP_TS_S);
 
         bool smc_updated = outer_smc_step_adaptive(&smc,
                                                    est.e2_filt, est.e3_hat, est.c_hat,
-                                                   v_cmd_out, seg_elapsed_s,
+                                                   v_eff_ctrl, seg_elapsed_s,
                                                    drv.v_a_ref_mps, drv.v_a_mps,
                                                    drv.v_b_ref_mps, drv.v_b_mps,
-                                                   smc_track_active, OBSERVER_LOOP_TS_S);
+                                                   smc_track_active, line.line_detected,
+                                                   OBSERVER_LOOP_TS_S);
         if (smc_updated) {
             sum_dt_smc_ms += (double)(smc.last_dt_smc_s * 1000.0f);
             smc_update_cnt++;
