@@ -281,7 +281,8 @@ void outer_estimator_step_observer_100hz(outer_estimator_t *est,
 
     /*
      * 1. Uoc luong do cong quy dao c_hat = w_act / v_denom qua bo loc thong thap bac 1
-     *    (tau_c = 35 ms), kep trong gioi han vat ly |c_hat| <= 3.0 rad/m (R >= 0.33 m).
+     *    (OUTER_OBS_TAU_C_S = 350 ms, fc ~ 0.45 Hz), kep |c_hat| <= OUTER_OBS_C_MAX_RADM (2.2 rad/m).
+     *    Hang so thoi gian lon tach biet do cong thuc cua sa ban khoi nhip lai sua sai ~1.5 Hz.
      */
     float c_raw   = clampf(w_act_rads / v_denom, -OUTER_OBS_C_MAX_RADM, OUTER_OBS_C_MAX_RADM);
     float alpha_c = ts_in_s / (OUTER_OBS_TAU_C_S + ts_in_s);

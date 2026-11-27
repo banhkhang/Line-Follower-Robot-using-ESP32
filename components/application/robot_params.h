@@ -52,7 +52,7 @@
 #define ROBOT_TRACK_WIDTH_M         0.180f
 #define ROBOT_HALF_TRACK_M          (ROBOT_TRACK_WIDTH_M * 0.5f)
 /* Kich thuoc tong the khung xe, banh tu do sau, vi tri trong tam (CoG) & cam bien */
-#define ROBOT_BODY_LENGTH_M         0.200f          /* Chieu dai than xe [m] */
+#define ROBOT_BODY_LENGTH_M         0.240f          /* Chieu dai than xe thuc te [m] (240 mm) */
 #define ROBOT_BODY_WIDTH_M          0.136f          /* Chieu rong than xe [m] */
 #define ROBOT_SENSOR_OFFSET_M       0.055f          /* d1: truc banh truoc -> day cam bien [m] */
 #define ROBOT_WHEELBASE_CASTER_M    0.152f          /* Khoang cach truc banh chu dong -> banh tu do sau [m] */
@@ -194,11 +194,11 @@
 #define OUTER_GN_BLEND_SPAN         0.20f           /* Khoang tron muot centroid -> Gauss-Newton */
 #define OUTER_LINE_TOTAL_I_MIN      0.25f           /* Nguong tong I_eff toi thieu de coi la thay line */
 /* 7.3 Bo quan sat Luenberger thich nghi (100 Hz, Ts_in = 0.010 s) */
-#define OUTER_OBS_TAU_C_S           0.100f          /* Can bang toi uu: bat chuyen tiep cua nhanh & van em tren duong thang */
+#define OUTER_OBS_TAU_C_S           0.350f          /* Tach bang thong do cong (<0.45 Hz) khoi nhip lai (~1.5 Hz) -> tang giam chan 3.4x */
 #define OUTER_OBS_V_MIN_DENOM       0.30f           /* Mau so van toc toi thieu on dinh do loi [m/s] */
 #define OUTER_OBS_V_ACTIVE_THR      0.04f           /* Nguong van toc kich hoat quan sat [m/s] */
-#define OUTER_OBS_P1_SLOW           0.89f           /* Cuc cham (loc nhieu doan thang/cua deu) */
-#define OUTER_OBS_P2_SLOW           0.92f
+#define OUTER_OBS_P1_SLOW           0.87f           /* Cuc cham (giam tre pha goc e3_hat, van loc nhieu tot) */
+#define OUTER_OBS_P2_SLOW           0.91f
 #define OUTER_OBS_P1_FAST           0.75f           /* Cuc nhanh (bat nhanh goc e3 khi chuyen tiep cua) */
 #define OUTER_OBS_P2_FAST           0.80f
 #define OUTER_OBS_ERR_BLEND_LO_M    0.00045f        /* Nguong duoi residual chuyen sang cuc nhanh [m] */
@@ -207,11 +207,12 @@
 #define OUTER_OBS_C_MAX_RADM        2.20f           /* Gioi han vat ly do cong |c_hat| <= 2.2 rad/m (R_min = 0.50 m) */
 
 /* 7.4 Bo dieu khien truot tich phan Integral SMC (Doria-Cerezo et al. ECC 2019)
- *     Tinh chinh toi uu chung cho ca He A (5S) & He B (7S) tai v = 0.50 m/s, tai 0..2 kg */
-#define OUTER_SMC_BETA_DEFAULT      0.025f          /* He so beta trong sigma = e2 + beta*e3 + z [m/rad] (tang giam chan goc) */
-#define OUTER_SMC_K_DEFAULT         0.19f           /* He so chuyen mach k > 0 [m/s] (k/phi = 10.6 -> em + bam cua chat) */
-#define OUTER_SMC_PHI_BL_DEFAULT    0.018f          /* Do day lop bien bao hoa chong rung [m] */
-#define OUTER_SMC_KI_DEFAULT        0.95f           /* He so tich phan ki trong z_dot = ki * e2 [1/s] (giam lech tinh cua U) */
+ *     Tham so ben vung (Robust) chung cho ca He A (5S) & He B (7S), moi mat san (phang & gach)
+ *     va moi dai tai 0..2 kg: zeta_min = 0.48 danh dinh, >= 0.32 tren toan mien bat dinh */
+#define OUTER_SMC_BETA_DEFAULT      0.016f          /* He so beta trong sigma = e2 + beta*e3 + z [m/rad] (giam hoi tiep duong c_hat) */
+#define OUTER_SMC_K_DEFAULT         0.19f           /* He so chuyen mach k > 0 [m/s] */
+#define OUTER_SMC_PHI_BL_DEFAULT    0.026f          /* Do day lop bien bao hoa [m] (k/phi = 7.3 -> du tru pha cao, het lac lu) */
+#define OUTER_SMC_KI_DEFAULT        1.05f           /* He so tich phan ki trong z_dot = ki * e2 [1/s] (triet sai so tinh cua U) */
 #define OUTER_SMC_Z_MAX_DEFAULT     0.008f          /* Gioi han chong bao hoa tich phan z [m] */
 #define OUTER_SMC_W_MAX_DEFAULT     2.60f           /* Gioi han w_cmd mac dinh [rad/s] (cua R=0.5m o 0.5m/s chi can 1.0) */
 #define OUTER_SMC_DW_MAX_STEP       1.25f           /* Slew-rate gioi han |delta w_cmd| moi nhip SMC [rad/s] chong dap 100% PWM */
@@ -233,22 +234,26 @@
 #define TRACK_LEG1_DIST_M           2.000f          /* Xuat phat (3000) -> Tram tai hang (1000) [m] */
 #define TRACK_LEG2_DIST_M           4.7091f         /* Tram tai hang (1000) -> Ket thuc (3000) [m] */
 /*
- * Cua so Odometry (tinh tu moc s_enc = 0 khi TRUC BANH CHU DONG roi tam tram tai X=1000):
- *  - Vi day cam bien di truoc truc banh d1 = 55 mm, day cam bien cham diem tach chu Y
- *    (X = 668.63 mm) tai s_enc ~ 2.184 m va thoat vung chu Y tai ~2.64 m.
- *  - Mo rong an toan cua so nhan dien nga ba chu Y: [2.05 .. 2.70] m.
+ * Cua so Odometry chang 2 (tinh tu moc s_enc = 0 khi xe roi TRAM TAI HANG):
+ *  - Do xe tien them STATION_STOP_ADVANCE_M = 100 mm ke tu tam vach tai hang (truc banh nam
+ *    truoc tam vach +45 mm de toan bo than xe dai 240 mm nam gon trong vung tai hang +-150 mm),
+ *    moi moc quang duong chang 2 (nga ba chu Y & vach dich) dich som hon STATION_EXTRA_ADV_M = 45 mm.
  */
+#define STATION_STOP_ADVANCE_M      0.100f          /* Quang duong tien them sau tam vach tai hang [m] (100 mm) */
+#define STATION_EXTRA_ADV_M         (STATION_STOP_ADVANCE_M - ROBOT_SENSOR_OFFSET_M) /* +45 mm so voi truc banh */
 
- #define TRACK_Y_WINDOW_MIN_M        2.05f
-#define TRACK_Y_WINDOW_MAX_M        2.70f
-#define TRACK_Y_DIP_START_M         1.85f           /* Bat dau giam toc nhe qua nga ba chu Y */
-#define TRACK_Y_DIP_END_M           2.95f
+#define TRACK_Y_WINDOW_MIN_M        2.00f
+#define TRACK_Y_WINDOW_MAX_M        2.65f
+#define TRACK_Y_DIP_START_M         1.80f           /* Bat dau giam toc nhe qua nga ba chu Y */
+#define TRACK_Y_DIP_END_M           2.90f
 #define TRACK_Y_DIP_DELTA_V_MPS     0.18f           /* Giam toi da 0.18 m/s tai giua nga ba (0.50 -> 0.32 m/s) */
-/* Quy hoach giam toc gon ve v_min = 0.10 m/s truoc tram & dich (a_dec ~ 0.80 m/s^2 <= a_max 1.0 m/s^2)
- * Giam ~50% thoi gian bo creep-speed nhung van giu dung chinh xac +-1 mm tai truc banh! */
-#define TRACK_DECEL_WINDOW_M        0.180f          /* Bat dau giam toc truoc dich 180 mm (cu: 300 mm) */
-#define TRACK_DECEL_MARGIN_M        0.030f          /* Dem bo o 0.10 m/s truoc khi cam bien cham vach (cu: 65 mm) */
-#define TRACK_LEG2_2KG_ODOM_COMP_M  0.035f          /* Bu nen lop odometry chang 2 khi cho 2 kg (+35 mm) de giam creep */
+/* Quy hoach giam toc gon ve v_align = 0.16 m/s truoc tram & dich (a_dec ~ 0.83 m/s^2 <= a_max 1.0 m/s^2).
+ * Cat giam tiep >50% thoi gian bo creep-speed (~0.18 s o tram, ~0.40 s o dich) ma van dung +-1 mm! */
+#define TRACK_ALIGN_SPEED_MPS       0.16f           /* Van toc tiep can & can chinh truc banh [m/s] (d_brake ~4..5 mm) */
+#define TRACK_DECEL_WINDOW_M        0.150f          /* Bat dau giam toc truoc dich 150 mm (cu: 180 mm) */
+#define TRACK_DECEL_MARGIN_M        0.015f          /* Dem bo o v_align truoc khi cam bien cham vach (cu: 30 mm) */
+#define TRACK_LEG2_1KG_ODOM_COMP_M  0.015f          /* Bu nen lop odometry chang 2 khi cho 1 kg (+15 mm) */
+#define TRACK_LEG2_2KG_ODOM_COMP_M  0.060f          /* Bu nen lop odometry chang 2 khi cho 2 kg (+60 mm) */
 /*
  * Phat hien vach cat ngang (Tram tai hang: rong 26 mm x dai 50 mm):
  *  - Profile 7 mat: >= 5 mat sang (I_eff > 0.15) & total_I > 3.20
@@ -271,8 +276,8 @@
  *    (w_cmd = 0) va bo tiep (d1 - EOL_PSF_OFFSET - brake_lead) de TRUC BANH dung tai X = 3000 +- 5 mm.
  */
 
-#define TRACK_GOAL_WIN_MIN_M        4.55f
-#define TRACK_GOAL_WIN_MAX_M        4.80f
+#define TRACK_GOAL_WIN_MIN_M        4.50f
+#define TRACK_GOAL_WIN_MAX_M        4.78f
 #define GOAL_EOL_TOT_THRESH_7S      1.65f           /* Nguong sut tong sang khi cam bien cham mep cuoi (7S) */
 #define GOAL_EOL_TOT_THRESH_5S      1.50f           /* Nguong sut tong sang (5S) */
 #define GOAL_EOL_CONFIRM_TICKS      3               /* 3 * 5 ms = 15 ms xac nhan het vach (tranh bat som) */

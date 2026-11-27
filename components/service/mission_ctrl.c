@@ -402,37 +402,38 @@ static void outer_ctrl_task(void *pvParameters)
 
         switch (mstate) {
             case MISSION_TO_LOAD: {
-                /* Giam toc muot khi tiep can vach ngang tram tai (s = 2.000 m) */
+                /* Giam toc muot ve TRACK_ALIGN_SPEED_MPS khi tiep can vach ngang tram tai (s = 2.000 m) */
                 float d_rem = TRACK_LEG1_DIST_M - drv.s_m;
-                v_cmd_out = outer_calc_decel_velocity(d_rem, smc.p.v_req, ROBOT_V_MIN_MPS,
+                v_cmd_out = outer_calc_decel_velocity(d_rem, smc.p.v_req, TRACK_ALIGN_SPEED_MPS,
                                                       TRACK_DECEL_WINDOW_M, TRACK_DECEL_MARGIN_M);
                 smc_track_active = true;
 
                 /*
                  * Chuyen sang pha can chinh truc banh ngay khi cam bien vua qua mep sau
                  * vach cat ngang (suon ra cua marker) hoac cham fail-safe odometry.
+                 * Luu moc hinh hoc truc banh thuan tuy; quang duong phanh d_brake tinh dong theo v_mps!
                  */
                 if ((marker_seen && !is_marker_now) || (drv.s_m >= TRACK_LEG1_DIST_M - 0.015f)) {
                     float s_cb_center = marker_seen
                                             ? (0.5f * (s_marker_entry_m + drv.s_m))
                                             : (TRACK_LEG1_DIST_M - ROBOT_SENSOR_OFFSET_M);
-                    float d_brake = outer_estimate_brake_lead_m(drv.v_mps, 0.0f);
-                    /* Trung diem truc banh cach day cam bien d1 = 55 mm ve phia sau */
-                    s_target_stop_m = s_cb_center + ROBOT_SENSOR_OFFSET_M
-                                    + smc.p.station_trim_m - d_brake;
+                    /* Tien them STATION_STOP_ADVANCE_M (100 mm) ke tu tam vach tai hang de than xe 240 mm
+                     * nam gon trong vung tai hang (+-150 mm quanh tam vach) */
+                    s_target_stop_m = s_cb_center + STATION_STOP_ADVANCE_M + smc.p.station_trim_m;
                     mstate        = MISSION_LOAD_AXLE_ALIGN;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
-                    ESP_LOGI(TAG, "Crossbar passed (center=%.3f m) -> align drive axle to %.3f m",
-                             s_cb_center, s_target_stop_m);
+                    ESP_LOGI(TAG, "Crossbar passed (center=%.3f m) -> advance +%.0f mm to %.3f m at %.2f m/s",
+                             s_cb_center, STATION_STOP_ADVANCE_M * 1000.0f, s_target_stop_m, TRACK_ALIGN_SPEED_MPS);
                 }
                 break;
             }
 
             case MISSION_LOAD_AXLE_ALIGN: {
-                v_cmd_out        = ROBOT_V_MIN_MPS;
+                v_cmd_out        = TRACK_ALIGN_SPEED_MPS;
                 smc_track_active = true;
-                if (drv.s_m >= s_target_stop_m) {
+                float d_brake    = outer_estimate_brake_lead_m(drv.v_mps, 0.0f);
+                if (drv.s_m >= (s_target_stop_m - d_brake)) {
                     drive_service_stop_brake();
                     outer_smc_reset_state(&smc);
                     v_cmd_out        = 0.0f;
@@ -526,31 +527,32 @@ static void outer_ctrl_task(void *pvParameters)
 
             case MISSION_TO_GOAL: {
                 /*
-                 * Cam bien cham dau mut cuoi duong (X = 3000 mm) tai s_axle ~ 4.654 m (1 kg)
-                 * va ~4.689 m (2 kg do nen lop nhe ~0.7%). Bu theo tai de thoi gian bo creep-speed
-                 * truoc EOL ngan gon nhu nhau o ca 1 kg & 2 kg ma van dung chinh xac +-1 mm.
+                 * Do xe dung tien them STATION_EXTRA_ADV_M (+45 mm) qua tam vach tai hang,
+                 * quang duong danh dinh chang 2 giam tuong ung (TRACK_LEG2_DIST_M - STATION_EXTRA_ADV_M)
+                 * de xe van giam toc dung nhip truoc EOL va giu creep ~0.10 s o ca 1 kg & 2 kg.
                  */
-                float leg2_odom_ref = TRACK_LEG2_DIST_M
-                                    + ((load_class_kg == 2U) ? TRACK_LEG2_2KG_ODOM_COMP_M : 0.0f);
+                float odom_comp_m   = (load_class_kg == 2U)
+                                          ? TRACK_LEG2_2KG_ODOM_COMP_M
+                                          : TRACK_LEG2_1KG_ODOM_COMP_M;
+                float leg2_odom_ref = (TRACK_LEG2_DIST_M - STATION_EXTRA_ADV_M) + odom_comp_m;
                 float d_rem = (leg2_odom_ref - ROBOT_SENSOR_OFFSET_M) - drv.s_m;
-                float v_prof = outer_calc_decel_velocity(d_rem, smc.p.v_req, ROBOT_V_MIN_MPS,
+                float v_prof = outer_calc_decel_velocity(d_rem, smc.p.v_req, TRACK_ALIGN_SPEED_MPS,
                                                          TRACK_DECEL_WINDOW_M, TRACK_DECEL_MARGIN_M);
                 float v_junc = outer_calc_y_junction_speed(drv.s_m, smc.p.v_req);
                 v_cmd_out        = fminf(v_prof, v_junc);
                 smc_track_active = true;
 
                 if (eol_triggered) {
-                    float d_brake = outer_estimate_brake_lead_m(drv.v_mps, load_measured_g * 0.001f);
                     s_eol_start_m = drv.s_m;
-                    d_goal_adv_m  = ROBOT_SENSOR_OFFSET_M - GOAL_EOL_PSF_OFFSET_M
-                                  + smc.p.goal_trim_m - d_brake;
-                    if (d_goal_adv_m < 0.005f) d_goal_adv_m = 0.005f;
+                    /* Luu quang duong hinh hoc thuan tuy; d_brake se duoc tinh dong theo v_mps trong pha align */
+                    d_goal_adv_m  = ROBOT_SENSOR_OFFSET_M - GOAL_EOL_PSF_OFFSET_M + smc.p.goal_trim_m;
+                    if (d_goal_adv_m < 0.010f) d_goal_adv_m = 0.010f;
 
                     mstate        = MISSION_GOAL_AXLE_ALIGN;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
-                    ESP_LOGI(TAG, "EOL detected at s=%.3f m -> creeping %.1f mm straight to align drive axle",
-                             drv.s_m, d_goal_adv_m * 1000.0f);
+                    ESP_LOGI(TAG, "EOL detected at s=%.3f m -> aligning %.1f mm straight at %.2f m/s",
+                             drv.s_m, d_goal_adv_m * 1000.0f, TRACK_ALIGN_SPEED_MPS);
                 } else if (drv.s_m >= TRACK_GOAL_WIN_MAX_M) {
                     drive_service_stop_brake();
                     goal_stop_s_m = drv.s_m;
@@ -564,12 +566,14 @@ static void outer_ctrl_task(void *pvParameters)
             }
 
             case MISSION_GOAL_AXLE_ALIGN: {
-                /* Khoa lai thang (w_cmd = 0) va bo cham dua TRUNG DIEM TRUC BANH vao dung vach dich */
-                v_cmd_out        = ROBOT_V_MIN_MPS;
+                /* Khoa lai thang (w_cmd = 0) va tien gon o TRACK_ALIGN_SPEED_MPS dua TRUC BANH vao vach dich */
+                v_cmd_out        = TRACK_ALIGN_SPEED_MPS;
                 smc_track_active = false;
                 float crept_m    = drv.s_m - s_eol_start_m;
+                float d_brake    = outer_estimate_brake_lead_m(drv.v_mps, load_measured_g * 0.001f);
+                float adv_stop_m = fmaxf(0.005f, d_goal_adv_m - d_brake);
 
-                if (crept_m >= d_goal_adv_m || state_timer_s >= 1.5f) {
+                if (crept_m >= adv_stop_m || state_timer_s >= 1.2f) {
                     drive_service_stop_brake();
                     goal_stop_s_m = drv.s_m;
                     goal_creep_mm = crept_m * 1000.0f;
@@ -579,7 +583,7 @@ static void outer_ctrl_task(void *pvParameters)
                     ESP_LOGI(TAG, "GOAL REACHED! Axle s=%.3f m (creep=%.1f mm, odom err=%+.1f mm) -> holding 2.0 s",
                              goal_stop_s_m, goal_creep_mm, (goal_stop_s_m - TRACK_LEG2_DIST_M) * 1000.0f);
                 } else {
-                    drive_service_set_chassis_vel(ROBOT_V_MIN_MPS, 0.0f);
+                    drive_service_set_chassis_vel(TRACK_ALIGN_SPEED_MPS, 0.0f);
                 }
                 break;
             }

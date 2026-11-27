@@ -490,8 +490,8 @@ function pl = encode_params(p)
 end
 
 function p = default_params()
-    p.v_req = 0.50; p.beta_smc = 0.025; p.k_smc = 0.19; p.phi_bl = 0.018;
-    p.ki_smc = 0.95; p.z_max = 0.008; p.w_max = 2.60;
+    p.v_req = 0.50; p.beta_smc = 0.016; p.k_smc = 0.19; p.phi_bl = 0.026;
+    p.ki_smc = 1.05; p.z_max = 0.008; p.w_max = 2.60;
     p.ts_min_s = 0.055; p.ts_max_s = 0.090; p.settle_margin_s = 0.010; p.settle_band_mps = 0.035;
     p.station_trim_m = 0.0; p.goal_trim_m = 0.0;
 end
