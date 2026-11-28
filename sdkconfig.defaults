@@ -4,13 +4,10 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# Custom OTA Partition Table
+# Giữ nguyên bảng phân vùng OTA để có thể nạp bản này 1 lần qua Wi-Fi OTA
+# (sau đó các lần nạp tiếp theo dùng UART) và giữ nguyên dữ liệu hiệu chuẩn NVS
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # FreeRTOS 1000 Hz (độ phân giải 1 ms)
 CONFIG_FREERTOS_HZ=1000
-
-# Tắt AMPDU để giảm jitter cho gói UDP 200 Hz
-CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
-CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n

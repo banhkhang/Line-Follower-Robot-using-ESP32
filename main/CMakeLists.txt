@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "main.c"
-        "../boot/ota.c"
         "../components/application/app.c"
 
         "../components/service/loadcell_service.c"
@@ -10,19 +9,15 @@ idf_component_register(
         "../components/service/sensor_service.c"
         "../components/service/outer_estimator.c"
         "../components/service/outer_smc.c"
-        "../components/service/data_logger.c"
         "../components/service/mission_ctrl.c"
-        "../components/service/matlab_link.c"
 
         "../components/driver/hx711.c"
         "../components/driver/tcrt5000.c"
         "../components/driver/motor.c"
         "../components/driver/encoder.c"
-        "../components/driver/wifi_ap.c"
         "../components/driver/usr_led.c"
     INCLUDE_DIRS
         "."
-        "../boot"
         "../components/application"
         "../components/service/include"
         "../components/driver/include"
@@ -31,14 +26,9 @@ idf_component_register(
         esp_driver_ledc
         esp_driver_gptimer
         esp_timer
-        esp_wifi
-        esp_netif
-        esp_event
-        esp_http_server
         esp_adc
         nvs_flash
         app_update
-        lwip
     PRIV_REQUIRES
         esp_rom
 )

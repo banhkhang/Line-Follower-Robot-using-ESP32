@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * mission_ctrl.c - Trien khai Task Vong ngoai (Core 0) & May trang thai nhiem vu
+ * mission_ctrl.c - Task Vong ngoai (Core 0) & May trang thai nhiem vu doc lap
  * ============================================================================
  */
 
@@ -25,78 +25,26 @@
 
 static const char *TAG = "mission_ctrl";
 
-#define OUTER_TASK_STACK_BYTES  6144
+#define OUTER_TASK_STACK_BYTES  5120
 #define OUTER_TASK_PRIORITY     14
 #define OUTER_TASK_CORE_ID      0
 
-static portMUX_TYPE          s_param_lock   = portMUX_INITIALIZER_UNLOCKED;
-static outer_smc_params_t    s_params;
-static bool                  s_inited       = false;
-static volatile bool         s_running      = false;
-static volatile bool         s_stop_req     = false;
+static outer_smc_params_t       s_params;
+static bool                     s_inited    = false;
+static volatile bool            s_running   = false;
 static volatile mission_state_t s_cur_state = MISSION_IDLE;
 
-/* Ngu canh chuyen vao task vong ngoai */
 typedef struct {
-    mission_run_cfg_t   cfg;
-    TaskHandle_t        caller_task;
-    robot_stop_reason_t stop_reason;
-    robot_run_summary_t summary;
+    mission_run_cfg_t     cfg;
+    TaskHandle_t          caller_task;
+    mission_stop_reason_t stop_reason;
 } run_job_t;
-
-static inline int16_t clamp_i16(float x)
-{
-    if (x > 32767.0f)  return 32767;
-    if (x < -32768.0f) return -32768;
-    return (int16_t)lroundf(x);
-}
-
-static inline uint16_t clamp_u16(float x)
-{
-    if (x <= 0.0f)     return 0;
-    if (x >= 65535.0f) return 65535;
-    return (uint16_t)lroundf(x);
-}
 
 void mission_ctrl_init(void)
 {
     if (s_inited) return;
-    portENTER_CRITICAL(&s_param_lock);
     outer_smc_get_default_params(&s_params);
-    portEXIT_CRITICAL(&s_param_lock);
     s_inited = true;
-}
-
-void mission_ctrl_set_params(const outer_smc_params_t *params)
-{
-    if (params == NULL) return;
-    if (!s_inited) mission_ctrl_init();
-
-    /* Dung outer_smc_set_params tam de ap dung bo kep gioi han an toan */
-    outer_smc_t tmp;
-    outer_smc_set_params(&tmp, params);
-
-    portENTER_CRITICAL(&s_param_lock);
-    s_params = tmp.p;
-    portEXIT_CRITICAL(&s_param_lock);
-
-    ESP_LOGI(TAG, "Params updated: v=%.2f beta=%.4f k=%.3f phi=%.4f ki=%.2f Ts=[%.0f..%.0f]ms",
-             tmp.p.v_req, tmp.p.beta_smc, tmp.p.k_smc, tmp.p.phi_bl, tmp.p.ki_smc,
-             tmp.p.ts_min_s * 1000.0f, tmp.p.ts_max_s * 1000.0f);
-}
-
-void mission_ctrl_get_params(outer_smc_params_t *out)
-{
-    if (out == NULL) return;
-    if (!s_inited) mission_ctrl_init();
-    portENTER_CRITICAL(&s_param_lock);
-    *out = s_params;
-    portEXIT_CRITICAL(&s_param_lock);
-}
-
-void mission_ctrl_request_stop(void)
-{
-    s_stop_req = true;
 }
 
 bool mission_ctrl_is_running(void)
@@ -118,71 +66,14 @@ static bool detect_crossbar(const line_sensor_reading_t *r)
     return (r->n_active >= MARKER_MIN_ACTIVE_5S) && (r->total_i > MARKER_TOTAL_I_THR_5S);
 }
 
-/* Dong goi 1 mau 52 byte (dung cho ca Live Stream He A va SRAM Log He B) */
-static void pack_log_sample(robot_log_sample_t *s,
-                            uint32_t t_ms,
-                            const outer_estimator_t *est,
-                            const outer_smc_t *smc,
-                            const drive_state_t *drv,
-                            const line_sensor_reading_t *line,
-                            mission_state_t mstate,
-                            bool smc_updated,
-                            bool marker_seen,
-                            uint8_t load_class)
-{
-    s->t_ms            = t_ms;
-    s->e2_raw_cmm      = clamp_i16(est->last_e2_raw * 100000.0f);  /* m -> 0.01 mm */
-    s->e2_filt_cmm     = clamp_i16(est->e2_filt     * 100000.0f);
-    s->e3_hat_cdeg     = clamp_i16(est->e3_hat * (18000.0f / 3.14159265f)); /* rad -> 0.01 deg */
-    s->c_hat_mrad      = clamp_i16(est->c_hat       * 1000.0f);
-    s->sigma_cmm       = clamp_i16(smc->sigma       * 100000.0f);
-    s->z_int_cmm       = clamp_i16(smc->z_int       * 100000.0f);
-    s->v_cmd_mms       = clamp_i16(drv->v_cmd_eff_mps * 1000.0f);
-    s->w_cmd_mrads     = clamp_i16(smc->w_cmd       * 1000.0f);
-    s->v_act_mms       = clamp_i16(drv->v_mps       * 1000.0f);
-    s->w_act_mrads     = clamp_i16(drv->w_rads      * 1000.0f);
-    s->va_ref_mms      = clamp_i16(drv->v_a_ref_mps * 1000.0f);
-    s->va_act_mms      = clamp_i16(drv->v_a_mps     * 1000.0f);
-    s->vb_ref_mms      = clamp_i16(drv->v_b_ref_mps * 1000.0f);
-    s->vb_act_mms      = clamp_i16(drv->v_b_mps     * 1000.0f);
-    s->pwm_a_cpct      = clamp_i16(drv->pwm_a_pct   * 100.0f);
-    s->pwm_b_cpct      = clamp_i16(drv->pwm_b_pct   * 100.0f);
-    s->s_enc_mm        = clamp_u16(drv->s_m         * 1000.0f);
-    s->total_i_m       = clamp_u16(line->total_i    * 1000.0f);
-    s->inner_jitter_us = drv->dt_us_err;
-
-    for (int i = 0; i < LINE_SENSOR_MAX_COUNT; i++) {
-        float n = line->norm[i];
-        if (n < 0.0f)   n = 0.0f;
-        if (n > 100.0f) n = 100.0f;
-        s->norm_s[i] = (uint8_t)lroundf(n);
-    }
-
-    uint8_t flags = ((uint8_t)mstate) & LOG_FLAG_STATE_MASK;
-    if (line->line_detected) flags |= LOG_FLAG_LINE_OK;
-    if (est->y_gn_active)    flags |= LOG_FLAG_Y_GN_ACTIVE;
-    if (smc_updated)         flags |= LOG_FLAG_SMC_UPDATED;
-    if (marker_seen)         flags |= LOG_FLAG_MARKER_SEEN;
-    s->state_flags = flags;
-
-    float dt_ms = smc->last_dt_smc_s * 1000.0f;
-    if (dt_ms < 0.0f)   dt_ms = 0.0f;
-    if (dt_ms > 255.0f) dt_ms = 255.0f;
-    s->dt_smc_ms  = (uint8_t)lroundf(dt_ms);
-    s->load_class = load_class;
-}
-
 /* Task thoi gian thuc Vong ngoai (Core 0, dong bo 200 Hz voi Core 1 GPTimer) */
 static void outer_ctrl_task(void *pvParameters)
 {
     run_job_t *job = (run_job_t *)pvParameters;
 
-    outer_smc_params_t p_local;
-    mission_ctrl_get_params(&p_local);
-
     outer_estimator_t est;
     outer_smc_t       smc;
-    outer_smc_init(&smc, &p_local);
+    outer_smc_init(&smc, &s_params);
 
     /* Doc mau cam bien dau tien de khoi tao bo loc & bo quan sat khong giat */
     line_sensor_reading_t line = {0};
@@ -202,14 +93,12 @@ static void outer_ctrl_task(void *pvParameters)
 
     usr_led_start_run_pattern();
 
-    mission_state_t     mstate          = MISSION_TO_LOAD;
-    robot_stop_reason_t stop_reason     = STOP_REASON_NONE;
+    mission_state_t       mstate      = MISSION_TO_LOAD;
+    mission_stop_reason_t stop_reason = STOP_REASON_NONE;
     s_cur_state = mstate;
 
     int64_t  run_start_us     = esp_timer_get_time();
     uint32_t tick_200hz       = 0;
-    uint32_t tick_100hz       = 0;
-    uint32_t wait_log_div     = 0;
 
     float    seg_elapsed_s    = 0.0f;
     float    state_timer_s    = 0.0f;
@@ -224,10 +113,10 @@ static void outer_ctrl_task(void *pvParameters)
     float    s_eol_start_m    = 0.0f;
     float    d_goal_adv_m     = ROBOT_SENSOR_OFFSET_M;
 
-    /* Bo dem 2 watchdog dung an toan [Stop] */
-    float    line_loss_timer_s = 0.0f;
-    float    err_over16_timer_s= 0.0f;
-    float    boot_hold_s       = 0.0f;
+    /* Bo dem 2 watchdog dung an toan & nut dung khan cap */
+    float    line_loss_timer_s  = 0.0f;
+    float    err_over16_timer_s = 0.0f;
+    float    boot_hold_s        = 0.0f;
 
     /* Trang thai can tai trong tai Tram tai hang */
     uint8_t  load_class_kg     = 0;
@@ -238,49 +127,32 @@ static void outer_ctrl_task(void *pvParameters)
     uint32_t load_cnt          = 0;
     bool     load_locked       = false;
 
-    /* Thong ke KPI tom tat */
+    /* Thong ke nhanh in ra UART khi ket thuc */
     float    max_abs_e2_mm     = 0.0f;
     double   sum_sq_e2_mm      = 0.0;
     uint32_t rms_e2_cnt        = 0;
-    float    station_stop_s_m  = 0.0f;
-    float    goal_stop_s_m     = 0.0f;
-    float    goal_creep_mm     = 0.0f;
-    double   sum_dt_smc_ms     = 0.0;
-    uint32_t smc_update_cnt    = 0;
-    uint32_t y_gn_calls        = 0;
 
-    ESP_LOGI(TAG, "Mission START | mode=%d profile=%dS v_req=%.2f m/s",
-             (int)job->cfg.mode, (int)job->cfg.sensor_profile, smc.p.v_req);
+    ESP_LOGI(TAG, "Mission START | profile=%dS v_req=%.2f m/s",
+             (int)job->cfg.sensor_profile, smc.p.v_req);
 
     for (;;) {
         /* Cho dung nhip 5 ms (200 Hz) tu Core 1 GPTimer (timeout 50 ms phong ho) */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         tick_200hz++;
 
-        /* 0. Kiem tra lenh dung khan cap (MATLAB STOP hoac nhan giu BOOT >= 150 ms) */
+        /* 0. Kiem tra nut dung khan cap (giu BOOT >= 150 ms) */
         if (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
             boot_hold_s += SENSOR_LOOP_TS_S;
             if (boot_hold_s >= 0.15f) {
-                s_stop_req = true;
+                drive_service_stop_brake();
+                stop_reason = STOP_REASON_MANUAL;
+                mstate      = MISSION_STOPPED_FAULT;
+                s_cur_state = mstate;
+                ESP_LOGW(TAG, "Manual STOP via BOOT -> Short Brake");
+                break;
             }
         } else {
             boot_hold_s = 0.0f;
-        }
-
-        if (s_stop_req) {
-            drive_service_stop_brake();
-            stop_reason = STOP_REASON_MANUAL;
-            mstate      = MISSION_STOPPED_FAULT;
-            s_cur_state = mstate;
-            ESP_LOGW(TAG, "Manual STOP requested -> Short Brake");
-            break;
-        }
-
-        /* Cap nhat nhanh tham so neu MATLAB vua gui CMD_SET_PARAMS trong luc chay He A */
-        if (job->cfg.mode == RUN_MODE_SYS_A_5S_LIVE) {
-            outer_smc_params_t p_new;
-            mission_ctrl_get_params(&p_new);
-            smc.p = p_new;
         }
 
         /* 1. Lay anh chup trang thai vong trong (thread-safe < 1 us) */
@@ -337,7 +209,7 @@ static void outer_ctrl_task(void *pvParameters)
             }
         }
 
-        /* Watchdog [Stop]: Mat line >= 2.0 s hoac |e2| > 16 mm lien tuc >= 2.0 s */
+        /* Watchdog an toan: Mat line >= 2.0 s hoac |e2| > 16 mm lien tuc >= 2.0 s */
         bool watchdogs_active = (mstate == MISSION_TO_LOAD ||
                                  mstate == MISSION_LOAD_AXLE_ALIGN ||
                                  mstate == MISSION_TO_GOAL);
@@ -380,7 +252,6 @@ static void outer_ctrl_task(void *pvParameters)
         if ((tick_200hz % OBSERVER_LOOP_DIVIDER) != 0U) {
             continue;
         }
-        tick_100hz++;
         seg_elapsed_s += OBSERVER_LOOP_TS_S;
         state_timer_s += OBSERVER_LOOP_TS_S;
 
@@ -390,29 +261,21 @@ static void outer_ctrl_task(void *pvParameters)
                                                 line.profile,
                                                 (load_class_kg == 2U) ? 2U : 1U,
                                                 OBSERVER_LOOP_TS_S);
-            if (est.y_gn_active) {
-                y_gn_calls++;
-            }
         }
 
         /* 4. May trang thai nhiem vu & Quy hoach van toc dai v_cmd */
-        float v_cmd_out       = 0.0f;
+        float v_cmd_out        = 0.0f;
         bool  smc_track_active = false;
         bool  goal_done_exit   = false;
 
         switch (mstate) {
             case MISSION_TO_LOAD: {
-                /* Giam toc muot ve TRACK_ALIGN_SPEED_MPS khi tiep can vach ngang tram tai (s = 2.000 m) */
+                /* Giam toc muot ve TRACK_ALIGN_SPEED_MPS khi tiep can vach ngang tram tai */
                 float d_rem = TRACK_LEG1_DIST_M - drv.s_m;
                 v_cmd_out = outer_calc_decel_velocity(d_rem, smc.p.v_req, TRACK_ALIGN_SPEED_MPS,
                                                       TRACK_DECEL_WINDOW_M, TRACK_DECEL_MARGIN_M);
                 smc_track_active = true;
 
-                /*
-                 * Chuyen sang pha can chinh truc banh ngay khi cam bien vua qua mep sau
-                 * vach cat ngang (suon ra cua marker) hoac cham fail-safe odometry.
-                 * Luu moc hinh hoc truc banh thuan tuy; quang duong phanh d_brake tinh dong theo v_mps!
-                 */
                 if ((marker_seen && !is_marker_now) || (drv.s_m >= TRACK_LEG1_DIST_M - 0.015f)) {
                     float s_cb_center = marker_seen
                                             ? (0.5f * (s_marker_entry_m + drv.s_m))
@@ -423,8 +286,8 @@ static void outer_ctrl_task(void *pvParameters)
                     mstate        = MISSION_LOAD_AXLE_ALIGN;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
-                    ESP_LOGI(TAG, "Crossbar passed (center=%.3f m) -> advance +%.0f mm to %.3f m at %.2f m/s",
-                             s_cb_center, STATION_STOP_ADVANCE_M * 1000.0f, s_target_stop_m, TRACK_ALIGN_SPEED_MPS);
+                    ESP_LOGI(TAG, "Crossbar passed (center=%.3f m) -> advance +%.0f mm to %.3f m",
+                             s_cb_center, STATION_STOP_ADVANCE_M * 1000.0f, s_target_stop_m);
                 }
                 break;
             }
@@ -438,7 +301,6 @@ static void outer_ctrl_task(void *pvParameters)
                     outer_smc_reset_state(&smc);
                     v_cmd_out        = 0.0f;
                     smc_track_active = false;
-                    station_stop_s_m = drv.s_m;
                     mstate           = MISSION_WAIT_LOAD;
                     state_timer_s    = 0.0f;
                     load_stable_s    = 0.0f;
@@ -446,8 +308,7 @@ static void outer_ctrl_task(void *pvParameters)
                     load_cnt         = 0;
                     load_locked      = false;
                     s_cur_state      = mstate;
-                    ESP_LOGI(TAG, "Loading station reached (axle s=%.3f m, err=%+.1f mm) -> Waiting load...",
-                             drv.s_m, (drv.s_m - TRACK_LEG1_DIST_M) * 1000.0f);
+                    ESP_LOGI(TAG, "Loading station reached (s=%.3f m) -> Waiting load...", drv.s_m);
                 }
                 break;
             }
@@ -461,7 +322,6 @@ static void outer_ctrl_task(void *pvParameters)
                 /* Doi xe dung han roi doc HX711 khong chan (non-blocking ~10 Hz) */
                 if (state_timer_s >= 0.35f && drive_service_is_stopped()) {
                     if (!loadcell_service_is_enabled()) {
-                        /* Du phong neu test khong gan HX711: cho 2.0s roi mac dinh 1 kg */
                         if (state_timer_s >= 2.0f) {
                             load_measured_g = 1000.0f;
                             load_locked     = true;
@@ -479,7 +339,6 @@ static void outer_ctrl_task(void *pvParameters)
                                     load_sum_g += g;
                                     load_cnt++;
                                 } else {
-                                    /* Khoi hang dang dao dong / tay nguoi dang dat -> reset cua so */
                                     load_anchor_g = g;
                                     load_sum_g    = g;
                                     load_cnt      = 1;
@@ -517,7 +376,7 @@ static void outer_ctrl_task(void *pvParameters)
                         mstate        = MISSION_TO_GOAL;
                         s_cur_state   = mstate;
 
-                        ESP_LOGI(TAG, "Load locked: %.1f g -> Class %u kg (%s branch) | Updating 2-DOF PI & departing",
+                        ESP_LOGI(TAG, "Load locked: %.1f g -> Class %u kg (%s branch) | Departing",
                                  load_measured_g, (unsigned)load_class_kg,
                                  (load_class_kg == 1U) ? "LEFT / upper" : "RIGHT / lower");
                     }
@@ -529,7 +388,7 @@ static void outer_ctrl_task(void *pvParameters)
                 /*
                  * Do xe dung tien them STATION_EXTRA_ADV_M (+45 mm) qua tam vach tai hang,
                  * quang duong danh dinh chang 2 giam tuong ung (TRACK_LEG2_DIST_M - STATION_EXTRA_ADV_M)
-                 * de xe van giam toc dung nhip truoc EOL va giu creep ~0.10 s o ca 1 kg & 2 kg.
+                 * de xe van giam toc dung nhip truoc EOL o ca 1 kg & 2 kg.
                  */
                 float odom_comp_m   = (load_class_kg == 2U)
                                           ? TRACK_LEG2_2KG_ODOM_COMP_M
@@ -544,19 +403,16 @@ static void outer_ctrl_task(void *pvParameters)
 
                 if (eol_triggered) {
                     s_eol_start_m = drv.s_m;
-                    /* Luu quang duong hinh hoc thuan tuy; d_brake se duoc tinh dong theo v_mps trong pha align */
                     d_goal_adv_m  = ROBOT_SENSOR_OFFSET_M - GOAL_EOL_PSF_OFFSET_M + smc.p.goal_trim_m;
                     if (d_goal_adv_m < 0.010f) d_goal_adv_m = 0.010f;
 
                     mstate        = MISSION_GOAL_AXLE_ALIGN;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
-                    ESP_LOGI(TAG, "EOL detected at s=%.3f m -> aligning %.1f mm straight at %.2f m/s",
-                             drv.s_m, d_goal_adv_m * 1000.0f, TRACK_ALIGN_SPEED_MPS);
+                    ESP_LOGI(TAG, "EOL detected at s=%.3f m -> aligning %.1f mm straight",
+                             drv.s_m, d_goal_adv_m * 1000.0f);
                 } else if (drv.s_m >= TRACK_GOAL_WIN_MAX_M) {
                     drive_service_stop_brake();
-                    goal_stop_s_m = drv.s_m;
-                    goal_creep_mm = 0.0f;
                     mstate        = MISSION_STOPPED_GOAL;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
@@ -566,7 +422,7 @@ static void outer_ctrl_task(void *pvParameters)
             }
 
             case MISSION_GOAL_AXLE_ALIGN: {
-                /* Khoa lai thang (w_cmd = 0) va tien gon o TRACK_ALIGN_SPEED_MPS dua TRUC BANH vao vach dich */
+                /* Khoa lai thang (w_cmd = 0) va tien gon dua TRUC BANH vao dung vach dich */
                 v_cmd_out        = TRACK_ALIGN_SPEED_MPS;
                 smc_track_active = false;
                 float crept_m    = drv.s_m - s_eol_start_m;
@@ -575,13 +431,11 @@ static void outer_ctrl_task(void *pvParameters)
 
                 if (crept_m >= adv_stop_m || state_timer_s >= 1.2f) {
                     drive_service_stop_brake();
-                    goal_stop_s_m = drv.s_m;
-                    goal_creep_mm = crept_m * 1000.0f;
                     mstate        = MISSION_STOPPED_GOAL;
                     state_timer_s = 0.0f;
                     s_cur_state   = mstate;
-                    ESP_LOGI(TAG, "GOAL REACHED! Axle s=%.3f m (creep=%.1f mm, odom err=%+.1f mm) -> holding 2.0 s",
-                             goal_stop_s_m, goal_creep_mm, (goal_stop_s_m - TRACK_LEG2_DIST_M) * 1000.0f);
+                    ESP_LOGI(TAG, "GOAL REACHED! s=%.3f m (creep=%.1f mm) -> holding 2.0 s",
+                             drv.s_m, crept_m * 1000.0f);
                 } else {
                     drive_service_set_chassis_vel(TRACK_ALIGN_SPEED_MPS, 0.0f);
                 }
@@ -604,64 +458,32 @@ static void outer_ctrl_task(void *pvParameters)
                 break;
         }
 
-        /* 5. Cap nhat Bo quan sat Luenberger (100 Hz) & Bo lap lich SMC thich nghi.
-         *    Su dung van toc thuc sau S-curve (v_eff_ctrl) de SMC khong van lai manh luc khoi hanh! */
+        /* 5. Cap nhat Bo quan sat Luenberger (100 Hz) & Bo lap lich SMC thich nghi */
         float v_eff_ctrl = drv.scurve_active ? fminf(v_cmd_out, drv.v_cmd_eff_mps) : v_cmd_out;
 
         outer_estimator_step_observer_100hz(&est, drv.v_mps, drv.w_rads,
                                             v_eff_ctrl, smc_track_active,
                                             line.line_detected, OBSERVER_LOOP_TS_S);
 
-        bool smc_updated = outer_smc_step_adaptive(&smc,
-                                                   est.e2_filt, est.e3_hat, est.c_hat,
-                                                   v_eff_ctrl, seg_elapsed_s,
-                                                   drv.v_a_ref_mps, drv.v_a_mps,
-                                                   drv.v_b_ref_mps, drv.v_b_mps,
-                                                   smc_track_active, line.line_detected,
-                                                   OBSERVER_LOOP_TS_S);
-        if (smc_updated) {
-            sum_dt_smc_ms += (double)(smc.last_dt_smc_s * 1000.0f);
-            smc_update_cnt++;
-        }
+        outer_smc_step_adaptive(&smc,
+                                est.e2_filt, est.e3_hat, est.c_hat,
+                                v_eff_ctrl, seg_elapsed_s,
+                                drv.v_a_ref_mps, drv.v_a_mps,
+                                drv.v_b_ref_mps, drv.v_b_mps,
+                                smc_track_active, line.line_detected,
+                                OBSERVER_LOOP_TS_S);
 
         /* Gui lenh (v_cmd, w_cmd) xuong vong trong 200 Hz (Core 1) */
         if (smc_track_active) {
             drive_service_set_chassis_vel(v_cmd_out, smc.w_cmd);
         }
 
-        /* 6. Tinh KPI sai so bam line (sau 0.6s khoi hanh) */
+        /* 6. Thong ke sai so bam line de bao cao ngan qua UART */
         if (smc_track_active && seg_elapsed_s > 0.60f && line.line_detected) {
             float e2_mm = fabsf(est.e2_filt) * 1000.0f;
             if (e2_mm > max_abs_e2_mm) max_abs_e2_mm = e2_mm;
             sum_sq_e2_mm += (double)(e2_mm * e2_mm);
             rms_e2_cnt++;
-        }
-
-        /* 7. Ghi log SRAM (He B) hoac Live Stream UDP (He A) */
-        bool should_emit = false;
-        if (job->cfg.enable_sram_log) {
-            /* Trong luc dung cho nguoi dat hang: giam toc do log xuong 5 Hz de tiet kiem SRAM */
-            if (mstate == MISSION_WAIT_LOAD) {
-                should_emit = ((wait_log_div++ % SYSTEM_B_WAIT_LOG_DIV) == 0U);
-            } else {
-                should_emit = true;
-            }
-        } else if (job->cfg.live_cb != NULL) {
-            should_emit = ((tick_100hz % SYSTEM_A_LIVE_DIV) == 0U);
-        }
-
-        if (should_emit) {
-            uint32_t t_ms = (uint32_t)((esp_timer_get_time() - run_start_us) / 1000LL);
-            robot_log_sample_t sample;
-            pack_log_sample(&sample, t_ms, &est, &smc, &drv, &line,
-                            mstate, smc_updated, marker_seen, load_class_kg);
-
-            if (job->cfg.enable_sram_log) {
-                data_logger_push(&sample);
-            }
-            if (job->cfg.live_cb != NULL) {
-                job->cfg.live_cb(&sample);
-            }
         }
 
         if (goal_done_exit) {
@@ -678,60 +500,38 @@ static void outer_ctrl_task(void *pvParameters)
     drive_service_stop_coast();
     usr_led_set(false);
 
-    /* Tong ket KPI */
     uint32_t dur_ms = (uint32_t)((esp_timer_get_time() - run_start_us) / 1000LL);
-    memset(&job->summary, 0, sizeof(job->summary));
-    job->summary.run_mode        = (uint8_t)job->cfg.mode;
-    job->summary.sensor_profile  = (uint8_t)job->cfg.sensor_profile;
-    job->summary.stop_reason     = (uint8_t)stop_reason;
-    job->summary.load_class_kg   = load_class_kg;
-    job->summary.sample_count    = job->cfg.enable_sram_log ? data_logger_count() : tick_100hz;
-    job->summary.run_duration_ms = dur_ms;
-    job->summary.load_measured_g = load_measured_g;
-    job->summary.max_abs_e2_mm   = max_abs_e2_mm;
-    job->summary.rms_e2_mm       = (rms_e2_cnt > 0) ? (float)sqrt(sum_sq_e2_mm / (double)rms_e2_cnt) : 0.0f;
-    job->summary.station_stop_s_m= station_stop_s_m;
-    job->summary.goal_stop_s_m   = goal_stop_s_m;
-    job->summary.goal_creep_mm   = goal_creep_mm;
-    job->summary.avg_dt_smc_ms   = (smc_update_cnt > 0) ? (float)(sum_dt_smc_ms / (double)smc_update_cnt) : 0.0f;
-    job->summary.y_gn_calls      = y_gn_calls;
+    float rms_mm    = (rms_e2_cnt > 0) ? (float)sqrt(sum_sq_e2_mm / (double)rms_e2_cnt) : 0.0f;
+    ESP_LOGI(TAG, "Mission END | reason=%d dur=%lu ms | load=%.0fg (%ukg) | max|e2|=%.2f mm RMS=%.2f mm",
+             (int)stop_reason, (unsigned long)dur_ms, load_measured_g,
+             (unsigned)load_class_kg, max_abs_e2_mm, rms_mm);
 
-    data_logger_set_summary(&job->summary);
     job->stop_reason = stop_reason;
-
-    ESP_LOGI(TAG, "Mission END | reason=%d dur=%lu ms | max|e2|=%.2f mm RMS=%.2f mm | avg_dt_smc=%.1f ms | log=%lu",
-             (int)stop_reason, (unsigned long)dur_ms,
-             job->summary.max_abs_e2_mm, job->summary.rms_e2_mm,
-             job->summary.avg_dt_smc_ms, (unsigned long)job->summary.sample_count);
-
-    s_cur_state = MISSION_IDLE;
-    s_running   = false;
+    s_cur_state      = MISSION_IDLE;
+    s_running        = false;
     xTaskNotifyGive(job->caller_task);
     vTaskDelete(NULL);
 }
 
-robot_stop_reason_t mission_ctrl_run_blocking(const mission_run_cfg_t *cfg,
-                                              robot_run_summary_t *out_summary)
+mission_stop_reason_t mission_ctrl_run_blocking(const mission_run_cfg_t *cfg)
 {
     if (cfg == NULL) return STOP_REASON_FAULT;
     if (!s_inited) mission_ctrl_init();
 
-    s_stop_req  = false;
     s_running   = true;
     s_cur_state = MISSION_IDLE;
 
-    /* Pha dem nguoc truoc khi chay (max(3s, t_switch) cho 7S / 3s cho 5S) */
+    /* Dem nguoc truoc khi chay (nhan BOOT de huy ngay) */
     if (cfg->countdown_rem_ms > 0) {
-        ESP_LOGI(TAG, "Countdown %lu ms before launch (press BOOT or send STOP to abort)...",
+        ESP_LOGI(TAG, "Countdown %lu ms before launch (press BOOT to abort)...",
                  (unsigned long)cfg->countdown_rem_ms);
         usr_led_start_blink(150);
         uint32_t waited = 0;
         while (waited < cfg->countdown_rem_ms) {
-            if (s_stop_req || gpio_get_level(PIN_BOOT_BUTTON) == 0) {
+            if (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
                 usr_led_set(false);
                 s_running = false;
                 ESP_LOGW(TAG, "Launch aborted during countdown");
-                /* Doi nha nut BOOT */
                 while (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(20));
                 }
@@ -764,11 +564,6 @@ robot_stop_reason_t mission_ctrl_run_blocking(const mission_run_cfg_t *cfg,
         return STOP_REASON_FAULT;
     }
 
-    /* Cho den khi outer_ctrl_task ket thuc */
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    if (out_summary != NULL) {
-        *out_summary = job.summary;
-    }
     return job.stop_reason;
 }
